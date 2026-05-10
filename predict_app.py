@@ -9,6 +9,7 @@ A股价格预测工具
 import os
 import sys
 import io
+import json
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -42,6 +43,102 @@ st.caption("支持 LSTM / GRU / 1D-CNN / ARIMA / EGARCH 多模型集成预测")
 
 config = load_config()
 predict_cfg = config.get("predict", {})
+
+
+def _serialize_results() -> bytes:
+    """将训练结果序列化为 JSON（不含模型对象，便于下载保存）"""
+    data = {
+        "stock_code": st.session_state.stock_code,
+        "stock_name": st.session_state.stock_name,
+        "ensemble_weights": st.session_state.ensemble_weights,
+        "save_time": datetime.now().isoformat(),
+    }
+    if st.session_state.predictions:
+        preds = st.session_state.predictions
+        data["predictions"] = {
+            k: v.tolist() if isinstance(v, np.ndarray) else v
+            for k, v in preds.items()
+            if k != "model_predictions"
+        }
+        if preds.get("model_predictions"):
+            data["predictions"]["model_predictions"] = {
+                k: v.tolist() if isinstance(v, np.ndarray) else v
+                for k, v in preds["model_predictions"].items()
+            }
+
+    if st.session_state.train_results:
+        data["train_results"] = {}
+        for name, r in st.session_state.train_results.items():
+            data["train_results"][name] = {
+                "model_name": r.model_name,
+                "cv_metrics": r.cv_metrics,
+                "training_time": r.training_time,
+                "test_predictions": r.test_predictions.tolist() if hasattr(r.test_predictions, 'tolist') else [],
+                "test_actuals": r.test_actuals.tolist() if hasattr(r.test_actuals, 'tolist') else [],
+                "confidence_lower": r.confidence_lower.tolist() if hasattr(r.confidence_lower, 'tolist') else [],
+                "confidence_upper": r.confidence_upper.tolist() if hasattr(r.confidence_upper, 'tolist') else [],
+                "future_predictions": r.future_predictions.tolist() if hasattr(r.future_predictions, 'tolist') else [],
+                "future_conf_lower": r.future_conf_lower.tolist() if hasattr(r.future_conf_lower, 'tolist') else [],
+                "future_conf_upper": r.future_conf_upper.tolist() if hasattr(r.future_conf_upper, 'tolist') else [],
+                "train_history": r.train_history,
+                "feature_cols": r.feature_cols,
+                "n_features": r.n_features,
+            }
+
+    if st.session_state.stock_data is not None:
+        df = st.session_state.stock_data.copy()
+        df.index = df.index.strftime("%Y-%m-%d")
+        data["stock_data"] = df.to_dict(orient="split")
+
+    return json.dumps(data, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+
+
+def _deserialize_results(content: bytes):
+    """从 JSON 恢复训练结果到 session_state"""
+    from src.predict.training import TrainResult
+    data = json.loads(content.decode("utf-8"))
+
+    st.session_state.stock_code = data.get("stock_code")
+    st.session_state.stock_name = data.get("stock_name")
+    st.session_state.ensemble_weights = data.get("ensemble_weights")
+
+    if "stock_data" in data:
+        sd = data["stock_data"]
+        df = pd.DataFrame(sd["data"], columns=sd["columns"], index=sd["index"])
+        df.index = pd.to_datetime(df.index)
+        df.index.name = "date"
+        st.session_state.stock_data = df
+
+    if "train_results" in data:
+        results = {}
+        for name, rd in data["train_results"].items():
+            tr = TrainResult(model_name=rd["model_name"])
+            tr.cv_metrics = rd.get("cv_metrics", {})
+            tr.training_time = rd.get("training_time", 0)
+            tr.test_predictions = np.array(rd.get("test_predictions", []))
+            tr.test_actuals = np.array(rd.get("test_actuals", []))
+            tr.confidence_lower = np.array(rd.get("confidence_lower", []))
+            tr.confidence_upper = np.array(rd.get("confidence_upper", []))
+            tr.future_predictions = np.array(rd.get("future_predictions", []))
+            tr.future_conf_lower = np.array(rd.get("future_conf_lower", []))
+            tr.future_conf_upper = np.array(rd.get("future_conf_upper", []))
+            tr.train_history = rd.get("train_history", {})
+            tr.feature_cols = rd.get("feature_cols", [])
+            tr.n_features = rd.get("n_features", 0)
+            results[name] = tr
+        st.session_state.train_results = results
+
+    if "predictions" in data:
+        preds = data["predictions"]
+        restored = {}
+        for k, v in preds.items():
+            if k == "model_predictions":
+                restored[k] = {mk: np.array(mv) for mk, mv in v.items()}
+            elif isinstance(v, list):
+                restored[k] = np.array(v)
+            else:
+                restored[k] = v
+        st.session_state.predictions = restored
 
 # ═══════ Session State 初始化 ═══════
 
@@ -106,6 +203,19 @@ with st.sidebar:
                     st.success(f"解析成功: {len(df)} 条数据")
                 except Exception as e:
                     st.error(str(e))
+
+    st.divider()
+
+    # 恢复历史结果
+    st.subheader("恢复历史结果")
+    uploaded_result = st.file_uploader("上传之前导出的结果文件", type=["json"], key="result_upload")
+    if uploaded_result and st.button("恢复结果", use_container_width=True):
+        try:
+            _deserialize_results(uploaded_result.read())
+            st.success("恢复成功！")
+            st.rerun()
+        except Exception as e:
+            st.error(f"恢复失败: {e}")
 
     st.divider()
 
@@ -579,6 +689,20 @@ with tab6:
     st.subheader("导出结果")
 
     if st.session_state.train_results or st.session_state.predictions:
+        # 训练结果存档（JSON，可恢复）
+        st.markdown("#### 训练结果存档")
+        st.caption("下载后可在侧边栏"恢复历史结果"中上传，无需重新训练")
+        result_bytes = _serialize_results()
+        st.download_button(
+            "下载训练结果存档 (.json)",
+            data=result_bytes,
+            file_name=f"results_{st.session_state.stock_code}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+
+        st.divider()
+
         # Excel 导出
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
