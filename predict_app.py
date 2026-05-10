@@ -691,7 +691,7 @@ with tab6:
     if st.session_state.train_results or st.session_state.predictions:
         # 训练结果存档（JSON，可恢复）
         st.markdown("#### 训练结果存档")
-        st.caption("下载后可在侧边栏"恢复历史结果"中上传，无需重新训练")
+        st.caption('下载后可在侧边栏「恢复历史结果」中上传，无需重新训练')
         result_bytes = _serialize_results()
         st.download_button(
             "下载训练结果存档 (.json)",
