@@ -236,7 +236,7 @@ def train_egarch_model(returns: np.ndarray, close_prices: np.ndarray,
         for i in range(len(test_ret)):
             from arch import arch_model
             am = arch_model(returns[:split_pt + i], vol="EGARCH", p=1, q=1,
-                            mean="ARX", dist="normal")
+                            mean="AR", lags=1, dist="normal")
             res = am.fit(disp="off", show_warning=False)
             fc_mean, _ = predict_egarch(res, steps=1)
             preds_ret.append(fc_mean[0])

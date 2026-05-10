@@ -173,13 +173,14 @@ def fit_egarch(returns: np.ndarray, config: ModelConfig = None):
     """
     拟合 EGARCH(1,1)
     returns: 收益率序列（百分比）
+    使用 AR(1) 均值模型捕捉收益率自相关
     """
     from arch import arch_model
     import warnings
     warnings.filterwarnings("ignore")
 
     p, q = 1, 1
-    am = arch_model(returns, vol="EGARCH", p=p, q=q, mean="ARX", dist="normal")
+    am = arch_model(returns, vol="EGARCH", p=p, q=q, mean="AR", lags=1, dist="normal")
     result = am.fit(disp="off", show_warning=False)
     return result
 
