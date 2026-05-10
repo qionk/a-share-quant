@@ -127,36 +127,16 @@ def build_cnn(config: ModelConfig):
 
 def fit_arima(train_data: np.ndarray, exog: np.ndarray = None, config: ModelConfig = None):
     """
-    拟合 auto_arima
+    拟合 ARIMA(1,1,1) + 常数漂移
     train_data: 一维收盘价序列
-    exog: 外生变量矩阵
     """
-    import pmdarima as pm
+    from statsmodels.tsa.arima.model import ARIMA
     import warnings
     warnings.filterwarnings("ignore")
 
-    max_p = 5
-    max_q = 5
-    max_d = 2
-    if config:
-        stats = getattr(config, "_stats", None)
-        if stats:
-            max_p = stats.get("arima_max_p", 5)
-            max_q = stats.get("arima_max_q", 5)
-            max_d = stats.get("arima_max_d", 2)
-
-    model = pm.auto_arima(
-        train_data,
-        exogenous=exog,
-        start_p=1, start_q=1,
-        max_p=max_p, max_q=max_q, max_d=max_d,
-        seasonal=False,
-        stepwise=True,
-        suppress_warnings=True,
-        error_action="ignore",
-        n_jobs=-1,
-    )
-    return model
+    model = ARIMA(train_data, order=(1, 1, 1), exog=exog, trend='t')
+    result = model.fit()
+    return result
 
 
 def predict_arima(model, steps: int, exog_future: np.ndarray = None):
@@ -164,9 +144,10 @@ def predict_arima(model, steps: int, exog_future: np.ndarray = None):
     ARIMA 多步预测
     返回: (predictions, confidence_intervals)
     """
-    fc, conf = model.predict(n_periods=steps, exogenous=exog_future,
-                             return_conf_int=True, alpha=0.05)
-    return np.array(fc), np.array(conf)
+    forecast = model.get_forecast(steps=steps, exog=exog_future)
+    fc = np.array(forecast.predicted_mean)
+    conf = np.array(forecast.conf_int(alpha=0.05))
+    return fc, conf
 
 
 def fit_egarch(returns: np.ndarray, config: ModelConfig = None):

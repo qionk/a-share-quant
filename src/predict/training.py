@@ -177,9 +177,8 @@ def _calc_momentum_drift(close_prices: np.ndarray, lookback: int = 20) -> float:
 def train_arima_model(close_prices: np.ndarray, config: ModelConfig,
                       progress_callback=None) -> TrainResult:
     """
-    训练 ARIMA 模型（收益率 + 动量漂移）
-    纯 ARIMA 在股票收益率上通常选 (0,0,0)，预测为 0。
-    加入近期动量漂移（指数衰减）使预测有实际意义。
+    训练 ARIMA(1,1,1) 模型
+    直接在价格序列上训练，d=1 自带差分。
     """
     start = time.time()
     result = TrainResult(model_name="ARIMA")
@@ -187,35 +186,37 @@ def train_arima_model(close_prices: np.ndarray, config: ModelConfig,
     if progress_callback:
         progress_callback(0.1, "ARIMA: 拟合中...")
 
-    returns = pd.Series(close_prices).pct_change().dropna().values * 100
-
-    split_pt = int(len(returns) * 0.85)
-    train_ret, test_ret = returns[:split_pt], returns[split_pt:]
-    test_close = close_prices[split_pt + 1:]
+    split_pt = int(len(close_prices) * 0.85)
+    train_close = close_prices[:split_pt]
+    test_close = close_prices[split_pt:]
 
     try:
-        model = fit_arima(train_ret)
+        model = fit_arima(train_close)
         result.model_object = model
 
-        pred_rets = []
-        for i in range(len(test_ret)):
-            fc, _ = predict_arima(model, steps=1)
-            base_price_idx = split_pt + i
-            drift = _calc_momentum_drift(close_prices[:base_price_idx + 1])
-            pred_rets.append(fc[0] + drift)
-            model.update(test_ret[i:i+1])
+        # 滚动一步预测
+        from statsmodels.tsa.arima.model import ARIMA
+        history = list(train_close)
+        pred_prices = []
+        for i in range(len(test_close)):
+            m = ARIMA(history, order=(1, 1, 1), trend='t')
+            res = m.fit()
+            fc = np.array(res.get_forecast(steps=1).predicted_mean)[0]
+            pred_prices.append(fc)
+            history.append(test_close[i])
 
-        pred_rets = np.array(pred_rets)
-        pred_prices = returns_to_prices(close_prices[split_pt], pred_rets)
+            if progress_callback and i % 20 == 0:
+                progress_callback(0.1 + 0.8 * i / len(test_close), f"ARIMA: 滚动预测 {i}/{len(test_close)}")
 
-        n = min(len(pred_prices), len(test_close))
-        result.test_predictions = pred_prices[:n]
-        result.test_actuals = test_close[:n]
-        result.cv_metrics = calc_metrics(test_close[:n], pred_prices[:n])
+        pred_prices = np.array(pred_prices)
+        result.test_predictions = pred_prices
+        result.test_actuals = test_close
+        result.cv_metrics = calc_metrics(test_close, pred_prices)
+        result.model_object = res
 
-        avg_err = np.mean(np.abs(pred_prices[:n] - test_close[:n]))
-        result.confidence_lower = pred_prices[:n] - 1.96 * avg_err
-        result.confidence_upper = pred_prices[:n] + 1.96 * avg_err
+        avg_err = np.mean(np.abs(pred_prices - test_close))
+        result.confidence_lower = pred_prices - 1.96 * avg_err
+        result.confidence_upper = pred_prices + 1.96 * avg_err
 
     except Exception as e:
         result.cv_metrics = {"mae": np.nan, "rmse": np.nan, "mape": np.nan, "r2": np.nan}
@@ -339,18 +340,13 @@ def train_all_models(df: pd.DataFrame, selected_models: list, config: ModelConfi
         result.feature_cols = feature_cols
         result.n_features = n_features
 
-        # 未来预测：ARIMA收益率 + 动量漂移（指数衰减）
+        # 未来预测：ARIMA(1,1,1) 直接在价格上预测
         try:
             if result.model_object is not None:
-                fc_ret, conf_ret = predict_arima(result.model_object, steps=forecast_days)
-                drift = _calc_momentum_drift(close_arr)
-                decay = np.array([0.85 ** i for i in range(forecast_days)])
-                drifted_ret = fc_ret + drift * decay
-
-                last_price = close_arr[-1]
-                result.future_predictions = returns_to_prices(last_price, drifted_ret)
-                result.future_conf_lower = returns_to_prices(last_price, conf_ret[:, 0] + drift * decay)
-                result.future_conf_upper = returns_to_prices(last_price, conf_ret[:, 1] + drift * decay)
+                fc, conf = predict_arima(result.model_object, steps=forecast_days)
+                result.future_predictions = fc
+                result.future_conf_lower = conf[:, 0]
+                result.future_conf_upper = conf[:, 1]
         except Exception:
             result.future_predictions = np.array([])
 
