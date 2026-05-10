@@ -165,9 +165,22 @@ def train_dl_model(model_name: str, X, y, config: ModelConfig,
     return result
 
 
+def _calc_momentum_drift(close_prices: np.ndarray, lookback: int = 20) -> float:
+    """计算最近N天的线性趋势斜率，转换为日收益率(%)"""
+    recent = close_prices[-lookback:]
+    x = np.arange(len(recent))
+    coefs = np.polyfit(x, recent, deg=1)
+    daily_drift_pct = coefs[0] / close_prices[-1] * 100
+    return daily_drift_pct
+
+
 def train_arima_model(close_prices: np.ndarray, config: ModelConfig,
                       progress_callback=None) -> TrainResult:
-    """训练 ARIMA 模型（基于收益率序列，避免随机游走问题）"""
+    """
+    训练 ARIMA 模型（收益率 + 动量漂移）
+    纯 ARIMA 在股票收益率上通常选 (0,0,0)，预测为 0。
+    加入近期动量漂移（指数衰减）使预测有实际意义。
+    """
     start = time.time()
     result = TrainResult(model_name="ARIMA")
 
@@ -187,7 +200,9 @@ def train_arima_model(close_prices: np.ndarray, config: ModelConfig,
         pred_rets = []
         for i in range(len(test_ret)):
             fc, _ = predict_arima(model, steps=1)
-            pred_rets.append(fc[0])
+            base_price_idx = split_pt + i
+            drift = _calc_momentum_drift(close_prices[:base_price_idx + 1])
+            pred_rets.append(fc[0] + drift)
             model.update(test_ret[i:i+1])
 
         pred_rets = np.array(pred_rets)
@@ -324,14 +339,18 @@ def train_all_models(df: pd.DataFrame, selected_models: list, config: ModelConfi
         result.feature_cols = feature_cols
         result.n_features = n_features
 
-        # 未来预测（模型已在收益率上训练，预测结果也是收益率）
+        # 未来预测：ARIMA收益率 + 动量漂移（指数衰减）
         try:
             if result.model_object is not None:
                 fc_ret, conf_ret = predict_arima(result.model_object, steps=forecast_days)
+                drift = _calc_momentum_drift(close_arr)
+                decay = np.array([0.85 ** i for i in range(forecast_days)])
+                drifted_ret = fc_ret + drift * decay
+
                 last_price = close_arr[-1]
-                result.future_predictions = returns_to_prices(last_price, fc_ret)
-                result.future_conf_lower = returns_to_prices(last_price, conf_ret[:, 0])
-                result.future_conf_upper = returns_to_prices(last_price, conf_ret[:, 1])
+                result.future_predictions = returns_to_prices(last_price, drifted_ret)
+                result.future_conf_lower = returns_to_prices(last_price, conf_ret[:, 0] + drift * decay)
+                result.future_conf_upper = returns_to_prices(last_price, conf_ret[:, 1] + drift * decay)
         except Exception:
             result.future_predictions = np.array([])
 
