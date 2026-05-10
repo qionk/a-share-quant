@@ -10,6 +10,7 @@ import os
 import sys
 import io
 import json
+import time as _time
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -27,11 +28,18 @@ from src.predict.features import compute_technical_indicators, prepare_features,
 from src.predict.models import ModelConfig
 from src.predict.training import (
     train_all_models, compute_ensemble_weights, ensemble_predict,
-    calc_metrics, backtest_predictions,
+    calc_metrics, backtest_predictions, TrainingCallbacks,
 )
 from src.predict.model_store import save_model, list_models, delete_model, load_model
 from src.predict.continuous import (
     rolling_train, track_performance, should_retrain, get_model_status, cleanup_old_models,
+)
+from src.predict.supabase_store import (
+    is_configured as supabase_configured,
+    save_training_results as supabase_save,
+    load_latest_results as supabase_load,
+    list_available_stocks as supabase_list_stocks,
+    restore_to_session_state as supabase_restore,
 )
 from src.data import load_config
 
@@ -39,7 +47,7 @@ from src.data import load_config
 
 st.set_page_config(page_title="A股价格预测", page_icon="📈", layout="wide")
 st.title("A股价格预测工具")
-st.caption("支持 LSTM / GRU / 1D-CNN / ARIMA / EGARCH 多模型集成预测")
+st.caption("支持 LSTM / GRU / 1D-CNN / PatchTST / TFT / ARIMA / EGARCH 多模型集成预测")
 
 config = load_config()
 predict_cfg = config.get("predict", {})
@@ -219,9 +227,53 @@ with st.sidebar:
 
     st.divider()
 
+    # 云端训练结果
+    st.subheader("云端训练结果")
+    if supabase_configured():
+        try:
+            cloud_stocks = supabase_list_stocks()
+        except Exception:
+            cloud_stocks = []
+
+        if cloud_stocks:
+            cloud_options = {
+                f"{s['stock_name'] or s['stock_code']} ({s['stock_code']}) - {s['trained_at'][:10]}": s
+                for s in cloud_stocks
+            }
+            selected_cloud = st.selectbox(
+                "选择已有结果", options=list(cloud_options.keys()), key="cloud_select"
+            )
+            if selected_cloud:
+                info = cloud_options[selected_cloud]
+                models_str = ", ".join(info.get("selected_models", []))
+                st.caption(f"模型: {models_str} | 预测{info.get('forecast_days', '?')}天")
+
+            if st.button("加载云端结果", use_container_width=True):
+                try:
+                    info = cloud_options[selected_cloud]
+                    result = supabase_load(info["stock_code"])
+                    if result:
+                        supabase_restore(result[0], result[1])
+                        st.success("云端结果加载成功！")
+                        st.rerun()
+                    else:
+                        st.warning("未找到该股票的云端结果")
+                except Exception as e:
+                    err_msg = str(e)
+                    if "403" in err_msg or "blocked" in err_msg.lower() or "limit" in err_msg.lower():
+                        st.error("Supabase 免费版请求超限，请稍后再试（通常几小时后自动恢复）")
+                    else:
+                        st.error(f"加载失败: {e}")
+        else:
+            st.caption("暂无云端训练结果")
+    else:
+        st.caption("未配置云端数据库（设置 SUPABASE_URL/KEY）")
+
+    st.divider()
+
     # 模型选择
     st.subheader("模型选择")
-    all_models = ["LSTM", "GRU", "1D-CNN", "ARIMA", "EGARCH"]
+    all_models = ["LSTM", "GRU", "1D-CNN", "PatchTST", "TFT", "ARIMA", "EGARCH"]
     selected_models = st.multiselect("选择模型", all_models, default=all_models)
     use_ensemble = st.toggle("集成预测", value=True)
 
@@ -232,16 +284,34 @@ with st.sidebar:
     forecast_days = st.slider("预测天数", 1, 10, 5)
     look_back = st.slider("时间步长(天)", 10, 60, predict_cfg.get("default_look_back", 30))
 
-    quick_mode = st.toggle("快速模式", value=False, help="减少训练轮次，适合快速测试")
+    quick_mode = st.toggle("快速模式", value=False, help="减少训练轮次和模型参数，适合快速测试")
 
     with st.expander("高级参数"):
         if quick_mode:
-            epochs = st.slider("训练轮次", 10, 50, 20)
+            epochs = st.slider("训练轮次", 5, 30, 10)
         else:
             epochs = st.slider("训练轮次", 20, 200, predict_cfg.get("dl", {}).get("epochs", 100))
         batch_size = st.select_slider("批量大小", [8, 16, 32, 64], value=32)
         learning_rate = st.number_input("学习率", 0.0001, 0.01, 0.001, format="%.4f")
         dropout = st.slider("Dropout", 0.1, 0.5, 0.2)
+
+    with st.expander("Transformer参数"):
+        patchtst_cfg = predict_cfg.get("patchtst", {})
+        tft_cfg = predict_cfg.get("tft", {})
+        if quick_mode:
+            patchtst_d_model = st.select_slider("PatchTST d_model", [16, 32, 64], value=16)
+            patchtst_n_layers = st.slider("PatchTST编码器层数", 1, 2, 1)
+            tft_hidden = st.select_slider("TFT隐藏层", [8, 16, 32], value=8)
+            tft_n_heads = st.select_slider("TFT注意力头数", [1, 2, 4], value=2)
+        else:
+            patchtst_d_model = st.select_slider("PatchTST d_model", [64, 128, 256],
+                                                 value=patchtst_cfg.get("d_model", 128))
+            patchtst_n_layers = st.slider("PatchTST编码器层数", 1, 4,
+                                           patchtst_cfg.get("n_encoder_layers", 2))
+            tft_hidden = st.select_slider("TFT隐藏层", [32, 64, 128],
+                                           value=tft_cfg.get("hidden_size", 64))
+            tft_n_heads = st.select_slider("TFT注意力头数", [2, 4, 8],
+                                            value=tft_cfg.get("n_heads", 4))
 
     st.divider()
 
@@ -263,6 +333,8 @@ with st.sidebar:
 def _build_config():
     dl_cfg = predict_cfg.get("dl", {})
     qm = predict_cfg.get("quick_mode", {})
+    pt_cfg = predict_cfg.get("patchtst", {})
+    tf_cfg = predict_cfg.get("tft", {})
 
     if quick_mode:
         units_lstm = qm.get("lstm_units", [32, 16])
@@ -288,60 +360,283 @@ def _build_config():
         gru_units=units_gru,
         cnn_filters=dl_cfg.get("cnn_filters", [64, 32]),
         cnn_kernel_size=dl_cfg.get("cnn_kernel_size", 3),
-        early_stop_patience=dl_cfg.get("early_stop_patience", 10),
+        early_stop_patience=3 if quick_mode else dl_cfg.get("early_stop_patience", 10),
+        patchtst_patch_size=pt_cfg.get("patch_size", 16),
+        patchtst_d_model=qm.get("patchtst_d_model", patchtst_d_model) if quick_mode else patchtst_d_model,
+        patchtst_n_heads=pt_cfg.get("n_heads", 4),
+        patchtst_n_encoder_layers=qm.get("patchtst_n_encoder_layers", patchtst_n_layers) if quick_mode else patchtst_n_layers,
+        patchtst_ff_dim=qm.get("patchtst_ff_dim", 256) if quick_mode else pt_cfg.get("ff_dim", 256),
+        patchtst_dropout=pt_cfg.get("dropout", 0.1),
+        tft_hidden_size=qm.get("tft_hidden_size", tft_hidden) if quick_mode else tft_hidden,
+        tft_n_heads=tft_n_heads,
+        tft_dropout=tf_cfg.get("dropout", 0.2),
+        tft_lstm_layers=qm.get("tft_lstm_layers", 1) if quick_mode else tf_cfg.get("lstm_layers", 1),
     )
+
+
+# ═══════ 实时训练回调 ═══════
+
+class StreamlitTrainingCallbacks(TrainingCallbacks):
+    """将训练回调连接到Streamlit UI容器"""
+
+    def __init__(self, model_containers, overall_progress, overall_status, log_container):
+        self.containers = model_containers
+        self.progress = overall_progress
+        self.status = overall_status
+        self.log = log_container
+        self.log_lines = []
+        self.loss_history = {}
+        self.start_time = None
+        self.total_models = 0
+        self.completed_models = 0
+        self.model_times = []
+
+    def on_training_start(self, model_list):
+        self.start_time = _time.time()
+        self.total_models = len(model_list)
+        for name in model_list:
+            self.loss_history[name] = {"train": [], "val": [], "lr": [], "grad": []}
+
+    def on_model_start(self, model_name, model_index, total_models):
+        if model_name in self.containers:
+            self.containers[model_name]["status"].info(f"**{model_name}** - 正在训练...")
+        pct = model_index / total_models
+        self.progress.progress(pct, text=f"训练 {model_name} ({model_index+1}/{total_models})")
+        elapsed = _time.time() - self.start_time
+        if self.completed_models > 0:
+            avg_time = elapsed / self.completed_models
+            eta = avg_time * (total_models - model_index)
+            self.status.markdown(f"已用: {elapsed:.0f}s | 预计剩余: {eta:.0f}s")
+        else:
+            self.status.markdown(f"已用: {elapsed:.0f}s")
+        self._add_log(f"[{model_name}] 开始训练")
+
+    def on_epoch_end(self, model_name, epoch, total_epochs,
+                     train_loss, val_loss, lr, grad_norm=None):
+        if model_name not in self.loss_history:
+            self.loss_history[model_name] = {"train": [], "val": [], "lr": [], "grad": []}
+        hist = self.loss_history[model_name]
+        hist["train"].append(train_loss)
+        hist["val"].append(val_loss)
+        hist["lr"].append(lr)
+        hist["grad"].append(grad_norm)
+
+        if model_name not in self.containers:
+            return
+
+        # 快速模式: 只在最后一个 epoch 更新 UI，避免 Plotly 渲染拖慢训练
+        if total_epochs <= 15 and epoch < total_epochs:
+            # 只更新轻量文本
+            self.containers[model_name]["metrics_row"].markdown(
+                f"Epoch **{epoch}/{total_epochs}** | "
+                f"Train: `{train_loss:.6f}` | Val: `{val_loss:.6f}`")
+            base = self.completed_models / self.total_models
+            within = (epoch / total_epochs) / self.total_models
+            self.progress.progress(min(base + within, 0.99),
+                text=f"训练 {model_name} - Epoch {epoch}/{total_epochs}")
+            return
+
+        c = self.containers[model_name]
+
+        # 损失曲线
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(y=hist["train"], name="Train Loss", mode="lines",
+                                  line=dict(color="#1f77b4")))
+        fig.add_trace(go.Scatter(y=hist["val"], name="Val Loss", mode="lines",
+                                  line=dict(color="#ff7f0e", dash="dash")))
+        fig.update_layout(height=280, xaxis_title="Epoch", yaxis_title="Loss",
+                          margin=dict(t=10, b=30, l=40, r=10))
+        c["loss_chart"].plotly_chart(fig, use_container_width=True)
+
+        # 指标行
+        c["metrics_row"].markdown(
+            f"Epoch **{epoch}/{total_epochs}** | "
+            f"Train: `{train_loss:.6f}` | Val: `{val_loss:.6f}`")
+
+        # 学习率 + 梯度范数
+        lr_text = f"学习率: `{lr:.2e}`"
+        if grad_norm is not None:
+            lr_text += f" | 梯度范数: `{grad_norm:.4f}`"
+        c["lr_grad"].markdown(lr_text)
+
+        # 进度
+        base = self.completed_models / self.total_models
+        within = (epoch / total_epochs) / self.total_models
+        self.progress.progress(min(base + within, 0.99),
+                               text=f"{model_name}: Epoch {epoch}/{total_epochs}")
+
+        if epoch % 5 == 0 or epoch == total_epochs:
+            self._add_log(f"[{model_name}] Epoch {epoch}/{total_epochs} - "
+                          f"loss: {train_loss:.6f}, val_loss: {val_loss:.6f}, lr: {lr:.2e}")
+
+    def on_overfitting_warning(self, model_name, epoch, val_loss, best_val_loss):
+        if model_name in self.containers:
+            pct_rise = ((val_loss / best_val_loss) - 1) * 100
+            self.containers[model_name]["warning"].warning(
+                f"过拟合警告: Epoch {epoch}, val_loss={val_loss:.6f} "
+                f"(最佳={best_val_loss:.6f}, 上升 {pct_rise:.1f}%)")
+        self._add_log(f"[{model_name}] 过拟合警告 Epoch {epoch}")
+
+    def on_model_end(self, model_name, result):
+        self.completed_models += 1
+        elapsed = _time.time() - self.start_time
+        if model_name in self.containers:
+            c = self.containers[model_name]
+            rmse = result.cv_metrics.get("rmse", np.nan)
+            if not np.isnan(rmse):
+                c["status"].success(
+                    f"**{model_name}** - 训练完成 | RMSE: {rmse:.4f} | 耗时: {result.training_time:.1f}s")
+            else:
+                err = result.train_history.get("error", "未知错误")
+                c["status"].error(f"**{model_name}** - 训练失败: {err}")
+        pct = self.completed_models / self.total_models
+        self.progress.progress(pct, text=f"已完成 {self.completed_models}/{self.total_models}")
+        self._add_log(f"[{model_name}] 完成 (耗时 {result.training_time:.1f}s)")
+
+    def on_training_complete(self, all_results):
+        total_time = _time.time() - self.start_time
+        self.progress.progress(1.0, text="全部训练完成!")
+        self.status.markdown(f"总耗时: **{total_time:.1f}s** | 模型数: {len(all_results)}")
+        self._add_log(f"全部训练完成, 总耗时 {total_time:.1f}s")
+
+    def _add_log(self, msg):
+        self.log_lines.append(msg)
+        self.log.code("\n".join(self.log_lines[-30:]), language=None)
 
 
 # ═══════ 训练触发 ═══════
 
 if btn_train and st.session_state.stock_data is not None:
+    # 杀死可能残留的训练进程，避免抢占 CPU
+    import subprocess, signal
+    try:
+        result = subprocess.run(["pgrep", "-f", "train_all_models"], capture_output=True, text=True)
+        for pid in result.stdout.strip().split("\n"):
+            if pid:
+                os.kill(int(pid), signal.SIGKILL)
+    except Exception:
+        pass
+
     st.session_state.training_active = True
     model_config = _build_config()
 
-    progress_bar = st.progress(0, text="准备训练...")
+    # 创建实时监控UI容器
+    st.subheader("训练进度")
+    overall_progress = st.progress(0, text="准备训练...")
+    overall_status = st.empty()
 
-    def update_progress(pct, msg):
-        progress_bar.progress(min(pct, 1.0), text=msg)
+    st.subheader("实时监控")
+    dl_selected = [m for m in selected_models if m in ("LSTM", "GRU", "1D-CNN", "PatchTST", "TFT")]
+    stat_selected = [m for m in selected_models if m in ("ARIMA", "EGARCH")]
+    all_ordered = dl_selected + stat_selected
 
-    with st.spinner("训练中，请稍候..."):
-        try:
+    model_containers = {}
+    if all_ordered:
+        model_tabs = st.tabs(all_ordered)
+        for i, mname in enumerate(all_ordered):
+            with model_tabs[i]:
+                model_containers[mname] = {
+                    "status": st.empty(),
+                    "loss_chart": st.empty(),
+                    "metrics_row": st.empty(),
+                    "lr_grad": st.empty(),
+                    "warning": st.empty(),
+                }
+
+    st.subheader("训练日志")
+    log_container = st.empty()
+
+    # 构建回调
+    sl_callbacks = StreamlitTrainingCallbacks(
+        model_containers, overall_progress, overall_status, log_container)
+
+    try:
+        if quick_mode:
+            # 快速模式: 独立进程训练，避免 Streamlit/TF 线程冲突
+            import subprocess, pickle, tempfile
+            overall_status.markdown("快速训练中...")
+
+            with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+                input_path = f.name
+                pickle.dump({
+                    "df": st.session_state.stock_data,
+                    "selected_models": selected_models,
+                    "config": model_config,
+                    "forecast_days": forecast_days,
+                }, f)
+
+            output_path = input_path + ".out"
+            worker = os.path.join(ROOT, "quick_train_worker.py")
+
+            proc = subprocess.run(
+                [sys.executable, worker, input_path, output_path],
+                capture_output=True, text=True, timeout=300,
+                env={**os.environ, "TF_CPP_MIN_LOG_LEVEL": "3"})
+
+            if proc.returncode != 0:
+                raise RuntimeError(f"训练失败:\n{proc.stderr[-1000:]}")
+
+            with open(output_path, "rb") as f:
+                results = pickle.load(f)
+
+            os.unlink(input_path)
+            os.unlink(output_path)
+        else:
             results = train_all_models(
                 st.session_state.stock_data,
                 selected_models,
                 model_config,
                 forecast_days=forecast_days,
-                progress_callback=update_progress,
+                callbacks=sl_callbacks,
+                quick=False,
             )
-            st.session_state.train_results = results
 
-            # 集成预测
-            if use_ensemble and len(results) > 1:
-                weights = compute_ensemble_weights(results)
-                last_price = st.session_state.stock_data["close"].iloc[-1]
-                preds = ensemble_predict(results, weights, forecast_days, last_price)
-                st.session_state.ensemble_weights = weights
-                st.session_state.predictions = preds
-            elif results:
-                first_result = list(results.values())[0]
-                weights = {list(results.keys())[0]: 1.0}
-                st.session_state.ensemble_weights = weights
-                last_price = st.session_state.stock_data["close"].iloc[-1]
-                preds = ensemble_predict(results, weights, forecast_days, last_price)
-                st.session_state.predictions = preds
+        st.session_state.train_results = results
 
-            # 保存模型
-            for name, result in results.items():
-                if result.model_object is not None:
-                    try:
-                        save_model(st.session_state.stock_code, name, result)
-                    except Exception:
-                        pass
+        # 保存loss_history供Tab2展示
+        st.session_state["_loss_history"] = sl_callbacks.loss_history
 
-            progress_bar.progress(1.0, text="训练完成!")
-        except Exception as e:
-            st.error(f"训练失败: {e}")
-            import traceback
-            st.code(traceback.format_exc())
+        # 集成预测
+        weights = None
+        preds = None
+        if use_ensemble and len(results) > 1:
+            weights = compute_ensemble_weights(results)
+            last_price = st.session_state.stock_data["close"].iloc[-1]
+            preds = ensemble_predict(results, weights, forecast_days, last_price)
+            st.session_state.ensemble_weights = weights
+            st.session_state.predictions = preds
+        elif results:
+            weights = {list(results.keys())[0]: 1.0}
+            st.session_state.ensemble_weights = weights
+            last_price = st.session_state.stock_data["close"].iloc[-1]
+            preds = ensemble_predict(results, weights, forecast_days, last_price)
+            st.session_state.predictions = preds
+
+        # 保存模型
+        for name, result in results.items():
+            if result.model_object is not None:
+                try:
+                    save_model(st.session_state.stock_code, name, result)
+                except Exception:
+                    pass
+
+        # 保存到云端
+        if weights and preds:
+            try:
+                sid = supabase_save(
+                    st.session_state.stock_code, st.session_state.stock_name,
+                    results, weights, preds, model_config, forecast_days, selected_models,
+                    stock_data=st.session_state.stock_data)
+                if sid:
+                    st.toast("训练结果已同步到云端")
+            except Exception as e:
+                st.warning(f"云端保存失败: {e}")
+
+        overall_progress.progress(1.0, text="训练完成!")
+    except Exception as e:
+        st.error(f"训练失败: {e}")
+        import traceback
+        st.code(traceback.format_exc())
 
     st.session_state.training_active = False
     st.rerun()
@@ -402,25 +697,51 @@ with tab2:
     if st.session_state.train_results:
         results = st.session_state.train_results
 
+        # 训练总结
+        st.subheader("训练总结")
+        valid_results = {k: v for k, v in results.items()
+                         if v.cv_metrics.get("rmse") and not np.isnan(v.cv_metrics.get("rmse", np.nan))}
+        failed_results = {k: v for k, v in results.items() if k not in valid_results}
+        total_time = sum(r.training_time for r in results.values())
+
+        col_s1, col_s2, col_s3 = st.columns(3)
+        if valid_results:
+            best_name = min(valid_results, key=lambda k: valid_results[k].cv_metrics["rmse"])
+            col_s1.metric("最佳模型", best_name,
+                          delta=f"RMSE: {valid_results[best_name].cv_metrics['rmse']:.4f}")
+        col_s2.metric("训练模型数", f"{len(valid_results)}/{len(results)}")
+        col_s3.metric("总耗时", f"{total_time:.1f}s")
+
+        if failed_results:
+            for name, r in failed_results.items():
+                err = r.train_history.get("error", "未知错误")
+                st.error(f"{name} 训练失败: {err}")
+
         # 模型排名表
         st.subheader("模型排名（按 RMSE）")
+        def _fmt(v, fmt=".4f"):
+            if v is None or (isinstance(v, float) and np.isnan(v)):
+                return "N/A"
+            return f"{v:{fmt}}"
+
         ranking = []
         for name, r in results.items():
             m = r.cv_metrics
             ranking.append({
                 "模型": name,
-                "MAE": f"{m.get('mae', np.nan):.4f}",
-                "RMSE": f"{m.get('rmse', np.nan):.4f}",
-                "MAPE(%)": f"{m.get('mape', np.nan):.2f}",
-                "R²": f"{m.get('r2', np.nan):.4f}",
-                "耗时(秒)": f"{r.training_time:.1f}",
+                "MAE": _fmt(m.get("mae")),
+                "RMSE": _fmt(m.get("rmse")),
+                "MAPE(%)": _fmt(m.get("mape"), ".2f"),
+                "R²": _fmt(m.get("r2")),
+                "耗时(秒)": _fmt(r.training_time, ".1f"),
             })
         ranking_df = pd.DataFrame(ranking)
         st.dataframe(ranking_df, use_container_width=True, hide_index=True)
 
         # Loss 曲线
         st.subheader("训练损失曲线")
-        dl_results = {k: v for k, v in results.items() if k in ("LSTM", "GRU", "1D-CNN")}
+        dl_results = {k: v for k, v in results.items()
+                      if k in ("LSTM", "GRU", "1D-CNN", "PatchTST", "TFT")}
         if dl_results:
             fig = go.Figure()
             for name, r in dl_results.items():
@@ -436,6 +757,29 @@ with tab2:
                               title="各模型训练/验证损失")
             st.plotly_chart(fig, use_container_width=True)
 
+        # 详细学习率/梯度信息（如果有保存的loss_history）
+        loss_hist = st.session_state.get("_loss_history", {})
+        if loss_hist:
+            with st.expander("学习率 & 梯度范数变化"):
+                for name, hist in loss_hist.items():
+                    if hist.get("lr") and len(hist["lr"]) > 0:
+                        st.markdown(f"**{name}**")
+                        col_lr, col_gr = st.columns(2)
+                        with col_lr:
+                            fig_lr = go.Figure()
+                            fig_lr.add_trace(go.Scatter(y=hist["lr"], mode="lines", name="LR"))
+                            fig_lr.update_layout(height=200, title="学习率",
+                                                  margin=dict(t=30, b=20))
+                            st.plotly_chart(fig_lr, use_container_width=True)
+                        with col_gr:
+                            grads = [g for g in hist.get("grad", []) if g is not None]
+                            if grads:
+                                fig_gr = go.Figure()
+                                fig_gr.add_trace(go.Scatter(y=grads, mode="lines", name="Grad Norm"))
+                                fig_gr.update_layout(height=200, title="梯度范数",
+                                                      margin=dict(t=30, b=20))
+                                st.plotly_chart(fig_gr, use_container_width=True)
+
         # 集成权重
         if st.session_state.ensemble_weights:
             st.subheader("集成权重")
@@ -447,8 +791,18 @@ with tab2:
             ))
             fig.update_layout(height=300, title="模型权重分配（基于 1/RMSE）")
             st.plotly_chart(fig, use_container_width=True)
+
+        # 重新训练按钮
+        if st.button("重新训练所有模型", key="retrain_btn"):
+            st.session_state.train_results = None
+            st.session_state.predictions = None
+            st.session_state.ensemble_weights = None
+            st.rerun()
     else:
-        st.info("请先训练模型")
+        st.info("请先在侧边栏点击「训练所有模型」按钮开始训练")
+        if st.session_state.stock_data is not None:
+            st.markdown(f"**数据量**: {len(st.session_state.stock_data)} 天")
+            st.markdown(f"**已选模型**: {', '.join(selected_models)}")
 
 
 # ── Tab 3: 预测结果 ──────────────────────────────────────────
@@ -457,8 +811,13 @@ with tab3:
     if st.session_state.predictions and st.session_state.predictions.get("predicted_close") is not None \
        and len(st.session_state.predictions["predicted_close"]) > 0:
         preds = st.session_state.predictions
-        last_price = st.session_state.stock_data["close"].iloc[-1]
-        last_date = st.session_state.stock_data.index[-1]
+
+        if st.session_state.stock_data is not None:
+            last_price = st.session_state.stock_data["close"].iloc[-1]
+            last_date = st.session_state.stock_data.index[-1]
+        else:
+            last_price = preds["predicted_close"][0] / (1 + preds["daily_return"][0] / 100) if preds["daily_return"][0] != 0 else preds["predicted_close"][0]
+            last_date = pd.Timestamp.now()
 
         # 生成未来交易日日期
         future_dates = pd.bdate_range(start=last_date + timedelta(days=1), periods=forecast_days)
@@ -495,13 +854,17 @@ with tab3:
         st.plotly_chart(fig_ret, use_container_width=True)
 
         # 价格走势图（含置信区间）
-        hist_close = st.session_state.stock_data["close"].tail(60)
+        if st.session_state.stock_data is not None:
+            hist_close = st.session_state.stock_data["close"].tail(60)
+        else:
+            hist_close = pd.Series(dtype=float)
         fig_price = go.Figure()
 
         # 历史
-        fig_price.add_trace(go.Scatter(
-            x=hist_close.index, y=hist_close.values,
-            name="历史收盘价", line=dict(color="#1f77b4")))
+        if not hist_close.empty:
+            fig_price.add_trace(go.Scatter(
+                x=hist_close.index, y=hist_close.values,
+                name="历史收盘价", line=dict(color="#1f77b4")))
 
         # 预测
         fig_price.add_trace(go.Scatter(
@@ -551,7 +914,11 @@ with tab4:
         model_sel = st.selectbox("选择模型查看", list(results.keys()), key="eval_model")
         r = results[model_sel]
 
-        if len(r.test_predictions) > 0 and len(r.test_actuals) > 0:
+        has_test_data = len(r.test_predictions) > 0 and len(r.test_actuals) > 0
+        if not has_test_data:
+            st.info("云端加载的结果不含测试集数据，仅展示模型指标")
+
+        if has_test_data:
             fig_vs = go.Figure()
             x_range = list(range(len(r.test_actuals)))
             fig_vs.add_trace(go.Scatter(x=x_range, y=r.test_actuals,
@@ -574,7 +941,7 @@ with tab4:
         metric_keys = ["mae", "rmse", "mape", "r2"]
         fig_bar = make_subplots(rows=1, cols=4, subplot_titles=metric_names)
         for i, (mname, mkey) in enumerate(zip(metric_names, metric_keys)):
-            vals = [results[m].cv_metrics.get(mkey, 0) for m in results]
+            vals = [results[m].cv_metrics.get(mkey) or 0 for m in results]
             fig_bar.add_trace(go.Bar(
                 x=list(results.keys()), y=vals, name=mname,
                 showlegend=False), row=1, col=i+1)
@@ -583,20 +950,23 @@ with tab4:
 
         # 回测
         st.subheader("方向预测准确率")
-        bt = backtest_predictions(st.session_state.stock_data, results, look_back)
-        if not bt.empty:
-            acc_by_model = bt.groupby("model")["direction_correct"].mean()
-            fig_acc = go.Figure(go.Bar(
-                x=acc_by_model.index.tolist(),
-                y=(acc_by_model.values * 100).tolist(),
-                text=[f"{v:.1f}%" for v in acc_by_model.values * 100],
-                textposition="auto",
-            ))
-            fig_acc.add_hline(y=50, line_dash="dash", line_color="gray",
-                              annotation_text="随机基准 50%")
-            fig_acc.update_layout(height=300, yaxis_title="准确率(%)",
-                                  title="各模型方向预测准确率")
-            st.plotly_chart(fig_acc, use_container_width=True)
+        if st.session_state.stock_data is None:
+            st.info("云端结果无原始行情数据，无法进行方向回测")
+        else:
+            bt = backtest_predictions(st.session_state.stock_data, results, look_back)
+            if not bt.empty:
+                acc_by_model = bt.groupby("model")["direction_correct"].mean()
+                fig_acc = go.Figure(go.Bar(
+                    x=acc_by_model.index.tolist(),
+                    y=(acc_by_model.values * 100).tolist(),
+                    text=[f"{v:.1f}%" for v in acc_by_model.values * 100],
+                    textposition="auto",
+                ))
+                fig_acc.add_hline(y=50, line_dash="dash", line_color="gray",
+                                  annotation_text="随机基准 50%")
+                fig_acc.update_layout(height=300, yaxis_title="准确率(%)",
+                                      title="各模型方向预测准确率")
+                st.plotly_chart(fig_acc, use_container_width=True)
     else:
         st.info("请先训练模型")
 
@@ -713,7 +1083,10 @@ with tab6:
             # 预测结果
             if st.session_state.predictions and len(st.session_state.predictions.get("predicted_close", [])) > 0:
                 preds = st.session_state.predictions
-                last_date = st.session_state.stock_data.index[-1]
+                if st.session_state.stock_data is not None:
+                    last_date = st.session_state.stock_data.index[-1]
+                else:
+                    last_date = pd.Timestamp.now()
                 future_dates = pd.bdate_range(start=last_date + timedelta(days=1),
                                               periods=len(preds["predicted_close"]))
                 pred_df = pd.DataFrame({

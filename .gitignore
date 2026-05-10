@@ -5,3 +5,5 @@ models/
 data/
 .DS_Store
 *.egg-info/
+.streamlit/secrets.toml
+.claude/

@@ -25,6 +25,18 @@ class ModelConfig:
     gru_units: list = field(default_factory=lambda: [64, 32])
     cnn_filters: list = field(default_factory=lambda: [64, 32])
     cnn_kernel_size: int = 3
+    # PatchTST
+    patchtst_patch_size: int = 16
+    patchtst_d_model: int = 128
+    patchtst_n_heads: int = 4
+    patchtst_n_encoder_layers: int = 2
+    patchtst_ff_dim: int = 256
+    patchtst_dropout: float = 0.1
+    # TFT
+    tft_hidden_size: int = 64
+    tft_n_heads: int = 4
+    tft_dropout: float = 0.2
+    tft_lstm_layers: int = 1
 
 
 def _set_seed(seed=42):
@@ -118,6 +130,150 @@ def build_cnn(config: ModelConfig):
     ])
 
     model = Sequential(layers)
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=config.learning_rate),
+        loss="mse",
+    )
+    return model
+
+
+def build_patchtst(config: ModelConfig):
+    """
+    PatchTST: Patch + Transformer Encoder + Linear Head
+    """
+    _set_seed()
+    import tensorflow as tf
+    from tensorflow.keras import layers, Model
+
+    look_back = config.look_back
+    n_features = config.n_features
+    patch_size = config.patchtst_patch_size
+    d_model = config.patchtst_d_model
+    n_heads = config.patchtst_n_heads
+    n_layers = config.patchtst_n_encoder_layers
+    ff_dim = config.patchtst_ff_dim
+    drop = config.patchtst_dropout
+
+    while look_back // patch_size < 3 and patch_size > 4:
+        patch_size = patch_size // 2
+
+    n_patches = (look_back + patch_size - 1) // patch_size
+    pad_len = n_patches * patch_size - look_back
+
+    inputs = layers.Input(shape=(look_back, n_features))
+
+    x = inputs
+    if pad_len > 0:
+        x = layers.ZeroPadding1D(padding=(pad_len, 0))(x)
+
+    x = layers.Reshape((n_patches, patch_size * n_features))(x)
+    x = layers.Dense(d_model)(x)
+
+    pos_emb = layers.Embedding(n_patches, d_model)
+    positions = tf.range(n_patches)
+    x = x + pos_emb(positions)
+
+    for _ in range(n_layers):
+        attn_out = layers.MultiHeadAttention(
+            num_heads=n_heads, key_dim=d_model // n_heads, dropout=drop
+        )(x, x)
+        attn_out = layers.Dropout(drop)(attn_out)
+        x = layers.LayerNormalization(epsilon=1e-6)(x + attn_out)
+
+        ff_out = layers.Dense(ff_dim, activation="gelu")(x)
+        ff_out = layers.Dropout(drop)(ff_out)
+        ff_out = layers.Dense(d_model)(ff_out)
+        ff_out = layers.Dropout(drop)(ff_out)
+        x = layers.LayerNormalization(epsilon=1e-6)(x + ff_out)
+
+    x = layers.Flatten()(x)
+    x = layers.Dense(64, activation="relu")(x)
+    x = layers.Dropout(drop)(x)
+    outputs = layers.Dense(1)(x)
+
+    model = Model(inputs=inputs, outputs=outputs, name="PatchTST")
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=config.learning_rate),
+        loss="mse",
+    )
+    return model
+
+
+def build_tft(config: ModelConfig):
+    """
+    Temporal Fusion Transformer (简化版):
+    Variable Selection → LSTM Encoder → GRN → Temporal Attention → Output
+    """
+    _set_seed()
+    import tensorflow as tf
+    from tensorflow.keras import layers, Model
+
+    look_back = config.look_back
+    n_features = config.n_features
+    hidden = config.tft_hidden_size
+    n_heads = config.tft_n_heads
+    drop = config.tft_dropout
+    n_lstm = config.tft_lstm_layers
+
+    inputs = layers.Input(shape=(look_back, n_features))
+
+    # Variable Selection Network
+    context = layers.Flatten()(inputs)
+    context = layers.Dense(hidden, activation="relu")(context)
+    var_weights = layers.Dense(n_features, activation="softmax",
+                               name="variable_weights")(context)
+
+    # Per-feature projection + weighted sum
+    split_proj = []
+    for i in range(n_features):
+        feat_slice = layers.Lambda(lambda x, idx=i: x[:, :, idx:idx+1])(inputs)
+        feat_proj = layers.Dense(hidden)(feat_slice)
+        split_proj.append(feat_proj)
+
+    stacked = layers.Lambda(lambda x: tf.stack(x, axis=2))(split_proj)
+
+    var_w_expanded = layers.Lambda(
+        lambda x: tf.expand_dims(tf.expand_dims(x, 1), -1)
+    )(var_weights)
+
+    weighted = layers.Multiply()([stacked, var_w_expanded])
+    selected = layers.Lambda(lambda x: tf.reduce_sum(x, axis=2))(weighted)
+
+    # LSTM Encoder
+    lstm_out = selected
+    for i in range(n_lstm):
+        lstm_out = layers.LSTM(hidden, return_sequences=True,
+                               dropout=drop, name=f"tft_lstm_{i}")(lstm_out)
+
+    # Gated Residual Network
+    grn_h = layers.Dense(hidden, activation="elu")(lstm_out)
+    grn_h = layers.Dense(hidden)(grn_h)
+    grn_h = layers.Dropout(drop)(grn_h)
+    gate = layers.Dense(hidden, activation="sigmoid")(lstm_out)
+    grn_out = layers.Multiply()([gate, grn_h])
+    skip = layers.Lambda(lambda x: (1 - x[0]) * x[1])([gate, lstm_out])
+    grn_out = layers.Add()([grn_out, skip])
+    grn_out = layers.LayerNormalization()(grn_out)
+
+    # Temporal Self-Attention with static enrichment
+    static_ctx = layers.GlobalAveragePooling1D()(lstm_out)
+    static_ctx = layers.RepeatVector(look_back)(static_ctx)
+    enriched = layers.Add()([grn_out, static_ctx])
+
+    attn_out = layers.MultiHeadAttention(
+        num_heads=n_heads, key_dim=hidden // n_heads, dropout=drop
+    )(enriched, enriched)
+    attn_out = layers.Dropout(drop)(attn_out)
+    attn_out = layers.Add()([attn_out, enriched])
+    attn_out = layers.LayerNormalization()(attn_out)
+
+    # Output
+    last_step = layers.Lambda(lambda x: x[:, -1, :])(attn_out)
+    out = layers.Dense(hidden // 2, activation="relu")(last_step)
+    out = layers.Dropout(drop)(out)
+    outputs = layers.Dense(1)(out)
+
+    model = Model(inputs=inputs, outputs=outputs, name="TFT")
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=config.learning_rate),
         loss="mse",

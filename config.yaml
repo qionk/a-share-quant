@@ -79,10 +79,15 @@ predict:
     model_dir: models
 
   quick_mode:
-    epochs: 20
-    lstm_units: [32, 16]
-    gru_units: [32, 16]
-    look_back: 30
+    epochs: 10
+    lstm_units: [16, 8]
+    gru_units: [16, 8]
+    look_back: 20
+    patchtst_d_model: 16
+    patchtst_n_encoder_layers: 1
+    patchtst_ff_dim: 32
+    tft_hidden_size: 8
+    tft_lstm_layers: 1
 
   small_sample:
     threshold: 200
@@ -90,3 +95,17 @@ predict:
     lstm_units: [32, 16]
     gru_units: [32, 16]
     look_back: 20
+
+  patchtst:
+    patch_size: 16
+    d_model: 128
+    n_heads: 4
+    n_encoder_layers: 2
+    ff_dim: 256
+    dropout: 0.1
+
+  tft:
+    hidden_size: 64
+    n_heads: 4
+    dropout: 0.2
+    lstm_layers: 1

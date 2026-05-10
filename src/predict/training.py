@@ -15,9 +15,55 @@ from .features import (
     DEFAULT_FEATURE_COLS,
 )
 from .models import (
-    ModelConfig, build_lstm, build_gru, build_cnn,
+    ModelConfig, build_lstm, build_gru, build_cnn, build_patchtst, build_tft,
     fit_arima, predict_arima, fit_egarch, predict_egarch, returns_to_prices,
 )
+
+
+class TrainingCallbacks:
+    """训练回调协议：实时监控接口"""
+
+    def on_training_start(self, model_list: list) -> None:
+        pass
+
+    def on_model_start(self, model_name: str, model_index: int, total_models: int) -> None:
+        pass
+
+    def on_epoch_end(self, model_name: str, epoch: int, total_epochs: int,
+                     train_loss: float, val_loss: float, lr: float,
+                     grad_norm: float = None) -> None:
+        pass
+
+    def on_model_end(self, model_name: str, result) -> None:
+        pass
+
+    def on_training_complete(self, all_results: dict) -> None:
+        pass
+
+    def on_overfitting_warning(self, model_name: str, epoch: int,
+                                val_loss: float, best_val_loss: float) -> None:
+        pass
+
+
+class LegacyCallbackAdapter(TrainingCallbacks):
+    """将旧式 (pct, msg) 回调包装为 TrainingCallbacks"""
+
+    def __init__(self, fn, total_models: int):
+        self._fn = fn
+        self._total = total_models
+        self._idx = 0
+
+    def on_model_start(self, model_name, model_index, total_models):
+        self._idx = model_index
+        self._fn(model_index / total_models, f"训练 {model_name}...")
+
+    def on_epoch_end(self, model_name, epoch, total_epochs, train_loss, val_loss, lr, grad_norm=None):
+        base = self._idx / self._total
+        within = (epoch / total_epochs) / self._total
+        self._fn(base + within, f"{model_name}: Epoch {epoch}/{total_epochs}")
+
+    def on_training_complete(self, all_results):
+        self._fn(1.0, "全部完成")
 
 
 @dataclass
@@ -61,30 +107,72 @@ def calc_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
 
 
 def _train_dl_model(model, X_train, y_train, X_val, y_val, config: ModelConfig,
-                    progress_callback=None):
-    """训练深度学习模型（LSTM/GRU/CNN 通用）"""
+                    model_name: str = "", callbacks: TrainingCallbacks = None):
+    """训练深度学习模型（含LR调度、梯度监控、过拟合检测）"""
     import tensorflow as tf
 
-    callbacks = [
+    keras_callbacks = [
         tf.keras.callbacks.EarlyStopping(
             patience=config.early_stop_patience,
             restore_best_weights=True,
             monitor="val_loss",
-        )
+        ),
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss", factor=0.5, patience=5, min_lr=1e-6, verbose=0
+        ),
     ]
 
-    if progress_callback:
-        class ProgressCB(tf.keras.callbacks.Callback):
+    if callbacks:
+        x_sample = X_train[:min(8, len(X_train))]
+        y_sample = y_train[:min(8, len(y_train))]
+
+        class RichProgressCB(tf.keras.callbacks.Callback):
+            def __init__(self):
+                super().__init__()
+                self.best_val_loss = float("inf")
+                self.overfit_streak = 0
+                self._compute_grads = None
+
             def on_epoch_end(self, epoch, logs=None):
-                progress_callback(epoch + 1, config.epochs, logs or {})
-        callbacks.append(ProgressCB())
+                logs = logs or {}
+                train_loss = logs.get("loss", 0)
+                val_loss = logs.get("val_loss", 0)
+                lr = float(tf.keras.backend.get_value(self.model.optimizer.learning_rate))
+
+                grad_norm = None
+                if self._compute_grads is None:
+                    self._compute_grads = self.model.count_params() < 100000
+                if self._compute_grads and epoch % 5 == 0:
+                    try:
+                        with tf.GradientTape() as tape:
+                            preds = self.model(x_sample, training=True)
+                            loss = tf.reduce_mean(tf.keras.losses.mse(y_sample, tf.squeeze(preds)))
+                        grads = tape.gradient(loss, self.model.trainable_variables)
+                        total = sum(float(tf.reduce_sum(tf.square(g))) for g in grads if g is not None)
+                        grad_norm = float(np.sqrt(total))
+                    except Exception:
+                        self._compute_grads = False
+
+                callbacks.on_epoch_end(model_name, epoch + 1, config.epochs,
+                                       train_loss, val_loss, lr, grad_norm)
+
+                if val_loss < self.best_val_loss:
+                    self.best_val_loss = val_loss
+                    self.overfit_streak = 0
+                else:
+                    self.overfit_streak += 1
+                    if self.overfit_streak >= 3 and val_loss > self.best_val_loss * 1.1:
+                        callbacks.on_overfitting_warning(
+                            model_name, epoch + 1, val_loss, self.best_val_loss)
+
+        keras_callbacks.append(RichProgressCB())
 
     history = model.fit(
         X_train, y_train,
         validation_data=(X_val, y_val),
         epochs=config.epochs,
         batch_size=config.batch_size,
-        callbacks=callbacks,
+        callbacks=keras_callbacks,
         verbose=0,
     )
     return {k: [float(v) for v in vals] for k, vals in history.history.items()}
@@ -105,61 +193,78 @@ def _mc_dropout_predict(model, X, n_iter=100):
 
 
 def train_dl_model(model_name: str, X, y, config: ModelConfig,
-                   n_splits: int = 5, progress_callback=None) -> TrainResult:
+                   n_splits: int = 5, quick: bool = False,
+                   callbacks: TrainingCallbacks = None) -> TrainResult:
     """训练单个深度学习模型（含时序CV）"""
     start = time.time()
     result = TrainResult(model_name=model_name)
 
-    builders = {"LSTM": build_lstm, "GRU": build_gru, "1D-CNN": build_cnn}
+    builders = {"LSTM": build_lstm, "GRU": build_gru, "1D-CNN": build_cnn,
+                "PatchTST": build_patchtst, "TFT": build_tft}
     build_fn = builders[model_name]
 
-    # 时序交叉验证
-    splits = time_series_split(len(X), n_splits=n_splits)
-    cv_scores = []
-    all_history = {}
-
-    for fold_i, (train_idx, val_idx) in enumerate(splits):
-        X_tr, y_tr = X[train_idx], y[train_idx]
-        X_vl, y_vl = X[val_idx], y[val_idx]
-
-        model = build_fn(config)
-
-        def fold_progress(epoch, total, logs, _fold=fold_i, _total_folds=len(splits)):
-            if progress_callback:
-                overall = (_fold * total + epoch) / (_total_folds * total)
-                progress_callback(overall, f"Fold {_fold+1}/{_total_folds} - Epoch {epoch}/{total}")
-
-        hist = _train_dl_model(model, X_tr, y_tr, X_vl, y_vl, config, fold_progress)
-
-        y_pred = model.predict(X_vl, verbose=0).flatten()
-        fold_metrics = calc_metrics(y_vl, y_pred)
-        cv_scores.append(fold_metrics)
-
-        if fold_i == len(splits) - 1:
-            all_history = hist
-
-    # 汇总CV指标
-    result.cv_metrics = {
-        k: np.mean([s[k] for s in cv_scores if not np.isnan(s[k])])
-        for k in ["mae", "rmse", "mape", "r2"]
-    }
-
-    # 全量训练最终模型
     split_pt = int(len(X) * 0.85)
     X_train, X_test = X[:split_pt], X[split_pt:]
     y_train, y_test = y[:split_pt], y[split_pt:]
 
-    final_model = build_fn(config)
-    final_hist = _train_dl_model(final_model, X_train, y_train, X_test, y_test, config)
-    result.train_history = final_hist
-    result.model_object = final_model
+    if quick:
+        # 快速模式: 跳过CV，直接训练一次
+        import sys as _sys
+        print(f"[DEBUG] {model_name}: build model...", flush=True, file=_sys.stderr)
+        final_model = build_fn(config)
+        print(f"[DEBUG] {model_name}: params={final_model.count_params()}, start fit...", flush=True, file=_sys.stderr)
+        # 快速模式不传 callbacks，避免 Streamlit UI 更新拖慢训练
+        final_hist = _train_dl_model(final_model, X_train, y_train, X_test, y_test, config,
+                                      model_name=model_name, callbacks=None)
+        print(f"[DEBUG] {model_name}: fit done, predict...", flush=True, file=_sys.stderr)
+        result.train_history = final_hist
+        result.model_object = final_model
 
-    # 测试集预测 + 置信区间
-    mean_pred, lower, upper = _mc_dropout_predict(final_model, X_test)
-    result.test_predictions = mean_pred
-    result.test_actuals = y_test
-    result.confidence_lower = lower
-    result.confidence_upper = upper
+        y_pred = final_model.predict(X_test, verbose=0).flatten()
+        result.cv_metrics = calc_metrics(y_test, y_pred)
+        result.test_predictions = y_pred
+        result.test_actuals = y_test
+
+        # 快速模式: MC Dropout 仅 10 次
+        print(f"[DEBUG] {model_name}: MC dropout...", flush=True, file=_sys.stderr)
+        _, lower, upper = _mc_dropout_predict(final_model, X_test, n_iter=10)
+        result.confidence_lower = lower
+        result.confidence_upper = upper
+    else:
+        # 正常模式: 时序交叉验证
+        splits = time_series_split(len(X), n_splits=n_splits)
+        cv_scores = []
+
+        for fold_i, (train_idx, val_idx) in enumerate(splits):
+            X_tr, y_tr = X[train_idx], y[train_idx]
+            X_vl, y_vl = X[val_idx], y[val_idx]
+
+            model = build_fn(config)
+            hist = _train_dl_model(model, X_tr, y_tr, X_vl, y_vl, config,
+                                   model_name=model_name, callbacks=callbacks)
+
+            y_pred = model.predict(X_vl, verbose=0).flatten()
+            fold_metrics = calc_metrics(y_vl, y_pred)
+            cv_scores.append(fold_metrics)
+
+        result.cv_metrics = {
+            k: np.mean([s[k] for s in cv_scores if not np.isnan(s[k])])
+            for k in ["mae", "rmse", "mape", "r2"]
+        }
+
+        # 全量训练最终模型
+        final_model = build_fn(config)
+        final_hist = _train_dl_model(final_model, X_train, y_train, X_test, y_test, config,
+                                      model_name=model_name, callbacks=callbacks)
+        result.train_history = final_hist
+        result.model_object = final_model
+
+        # 测试集预测 + 置信区间
+        mean_pred, lower, upper = _mc_dropout_predict(final_model, X_test)
+        result.test_predictions = mean_pred
+        result.test_actuals = y_test
+        result.confidence_lower = lower
+        result.confidence_upper = upper
 
     result.training_time = time.time() - start
     return result
@@ -280,67 +385,112 @@ def train_egarch_model(returns: np.ndarray, close_prices: np.ndarray,
 
 
 def train_all_models(df: pd.DataFrame, selected_models: list, config: ModelConfig,
-                     forecast_days: int = 5, progress_callback=None) -> dict:
+                     forecast_days: int = 5, progress_callback=None,
+                     callbacks: TrainingCallbacks = None,
+                     quick: bool = False) -> dict:
     """
     批量训练所有选定模型
     返回: {model_name: TrainResult}
+    quick: 快速模式，跳过CV和减少MC Dropout
     """
+    # 向后兼容：旧式callback自动包装
+    if progress_callback and not callbacks:
+        callbacks = LegacyCallbackAdapter(progress_callback, len(selected_models))
+
     df_ind = compute_technical_indicators(df)
     scaled, scaler, feature_cols, cleaned_df = prepare_features(df_ind)
+
+    # 快速模式: 只用 5 个核心特征，大幅减少计算量
+    if quick:
+        core_names = ["close", "volume", "ma5", "pct_change", "rsi"]
+        core_idx = [i for i, c in enumerate(feature_cols) if c in core_names]
+        if len(core_idx) < 2:
+            core_idx = list(range(min(5, len(feature_cols))))
+        if 0 not in core_idx:
+            core_idx = [0] + core_idx
+        scaled = scaled[:, core_idx]
+        feature_cols = [feature_cols[i] for i in core_idx]
+        # 重建 scaler 匹配裁剪后的特征维度
+        from sklearn.preprocessing import MinMaxScaler
+        new_scaler = MinMaxScaler()
+        new_scaler.min_ = scaler.min_[core_idx]
+        new_scaler.scale_ = scaler.scale_[core_idx]
+        new_scaler.data_min_ = scaler.data_min_[core_idx]
+        new_scaler.data_max_ = scaler.data_max_[core_idx]
+        new_scaler.data_range_ = scaler.data_range_[core_idx]
+        new_scaler.n_features_in_ = len(core_idx)
+        new_scaler.feature_range = scaler.feature_range
+        scaler = new_scaler
+
     n_features = len(feature_cols)
     config.n_features = n_features
 
     X, y = create_sequences(scaled, config.look_back, target_col_idx=0)
 
+    import sys as _sys
+    print(f"[DEBUG] quick={quick}, features={n_features}, X.shape={X.shape}, "
+          f"epochs={config.epochs}, patience={config.early_stop_patience}", flush=True, file=_sys.stderr)
+
     results = {}
-    dl_models = [m for m in selected_models if m in ("LSTM", "GRU", "1D-CNN")]
+    dl_models = [m for m in selected_models if m in ("LSTM", "GRU", "1D-CNN", "PatchTST", "TFT")]
     stat_models = [m for m in selected_models if m in ("ARIMA", "EGARCH")]
 
     total = len(selected_models)
     done = 0
 
+    if callbacks:
+        callbacks.on_training_start(selected_models)
+
     for name in dl_models:
-        if progress_callback:
-            progress_callback(done / total, f"训练 {name}...")
+        if callbacks:
+            callbacks.on_model_start(name, done, total)
 
-        result = train_dl_model(name, X, y, config, n_splits=3)
-        result.scaler = scaler
-        result.feature_cols = feature_cols
-        result.n_features = n_features
+        try:
+            result = train_dl_model(name, X, y, config, n_splits=3, quick=quick, callbacks=callbacks)
+            result.scaler = scaler
+            result.feature_cols = feature_cols
+            result.n_features = n_features
 
-        # 反归一化测试集结果
-        result.test_predictions = inverse_transform_predictions(
-            result.test_predictions, scaler, n_features, 0)
-        result.test_actuals = inverse_transform_predictions(
-            result.test_actuals, scaler, n_features, 0)
-        result.confidence_lower = inverse_transform_predictions(
-            result.confidence_lower, scaler, n_features, 0)
-        result.confidence_upper = inverse_transform_predictions(
-            result.confidence_upper, scaler, n_features, 0)
+            # 反归一化测试集结果
+            result.test_predictions = inverse_transform_predictions(
+                result.test_predictions, scaler, n_features, 0)
+            result.test_actuals = inverse_transform_predictions(
+                result.test_actuals, scaler, n_features, 0)
+            result.confidence_lower = inverse_transform_predictions(
+                result.confidence_lower, scaler, n_features, 0)
+            result.confidence_upper = inverse_transform_predictions(
+                result.confidence_upper, scaler, n_features, 0)
 
-        # 重新算反归一化后的指标
-        result.cv_metrics = calc_metrics(result.test_actuals, result.test_predictions)
+            # 重新算反归一化后的指标
+            result.cv_metrics = calc_metrics(result.test_actuals, result.test_predictions)
 
-        # 未来预测
-        last_seq = X[-1:].copy()
-        future_preds = _predict_future_dl(result.model_object, last_seq, forecast_days,
-                                           scaler, n_features, 0)
-        result.future_predictions = future_preds
+            # 未来预测
+            last_seq = X[-1:].copy()
+            future_preds = _predict_future_dl(result.model_object, last_seq, forecast_days,
+                                               scaler, n_features, 0)
+            result.future_predictions = future_preds
 
+        except Exception as e:
+            result = TrainResult(model_name=name)
+            result.cv_metrics = {"mae": np.nan, "rmse": np.nan, "mape": np.nan, "r2": np.nan}
+            result.train_history = {"error": str(e)}
+            result.training_time = time.time()
+
+        if callbacks:
+            callbacks.on_model_end(name, result)
         results[name] = result
         done += 1
 
     close_arr = cleaned_df["close"].values if "close" in cleaned_df.columns else df["close"].dropna().values
 
     if "ARIMA" in stat_models:
-        if progress_callback:
-            progress_callback(done / total, "训练 ARIMA...")
+        if callbacks:
+            callbacks.on_model_start("ARIMA", done, total)
         result = train_arima_model(close_arr, config, progress_callback=None)
         result.scaler = scaler
         result.feature_cols = feature_cols
         result.n_features = n_features
 
-        # 未来预测：ARIMA(1,1,1) 直接在价格上预测
         try:
             if result.model_object is not None:
                 fc, conf = predict_arima(result.model_object, steps=forecast_days)
@@ -350,19 +500,20 @@ def train_all_models(df: pd.DataFrame, selected_models: list, config: ModelConfi
         except Exception:
             result.future_predictions = np.array([])
 
+        if callbacks:
+            callbacks.on_model_end("ARIMA", result)
         results["ARIMA"] = result
         done += 1
 
     if "EGARCH" in stat_models:
-        if progress_callback:
-            progress_callback(done / total, "训练 EGARCH...")
+        if callbacks:
+            callbacks.on_model_start("EGARCH", done, total)
         returns = pd.Series(close_arr).pct_change().dropna().values * 100
         result = train_egarch_model(returns, close_arr, config, progress_callback=None)
         result.scaler = scaler
         result.feature_cols = feature_cols
         result.n_features = n_features
 
-        # 未来预测
         try:
             if result.model_object is not None:
                 mean_fc, vol_fc = predict_egarch(result.model_object, steps=forecast_days)
@@ -372,11 +523,13 @@ def train_all_models(df: pd.DataFrame, selected_models: list, config: ModelConfi
         except Exception:
             result.future_predictions = np.array([])
 
+        if callbacks:
+            callbacks.on_model_end("EGARCH", result)
         results["EGARCH"] = result
         done += 1
 
-    if progress_callback:
-        progress_callback(1.0, "全部完成")
+    if callbacks:
+        callbacks.on_training_complete(results)
 
     return results
 
