@@ -1,0 +1,129 @@
+"""
+价格预测 - 特征工程
+技术指标计算 + 数据归一化 + 滑动窗口
+"""
+
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import MinMaxScaler
+
+
+def compute_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    计算技术指标，原地添加列
+    输入需包含: open, high, low, close, volume
+    """
+    df = df.copy()
+    close = df["close"]
+    high = df["high"]
+    low = df["low"]
+    volume = df["volume"]
+
+    # 均线
+    for w in [5, 10, 20, 60]:
+        df[f"ma{w}"] = close.rolling(w).mean()
+
+    # MACD (12, 26, 9)
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    df["dif"] = ema12 - ema26
+    df["dea"] = df["dif"].ewm(span=9, adjust=False).mean()
+    df["macd"] = (df["dif"] - df["dea"]) * 2
+
+    # RSI(14)
+    delta = close.diff()
+    gain = delta.where(delta > 0, 0.0).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0.0)).rolling(14).mean()
+    rs = gain / loss.replace(0, np.nan)
+    df["rsi"] = 100 - 100 / (1 + rs)
+
+    # 布林带 (20, 2)
+    ma20 = close.rolling(20).mean()
+    std20 = close.rolling(20).std()
+    df["boll_upper"] = ma20 + 2 * std20
+    df["boll_mid"] = ma20
+    df["boll_lower"] = ma20 - 2 * std20
+
+    # 涨跌幅（若不存在则计算）
+    if "pct_change" not in df.columns or df["pct_change"].isna().all():
+        df["pct_change"] = close.pct_change() * 100
+
+    # 成交量均线
+    df["vol_ma5"] = volume.rolling(5).mean()
+    df["vol_ma20"] = volume.rolling(20).mean()
+
+    return df
+
+
+# 默认特征列（训练用）
+DEFAULT_FEATURE_COLS = [
+    "close", "open", "high", "low", "volume",
+    "ma5", "ma10", "ma20", "ma60",
+    "dif", "dea", "macd", "rsi",
+    "boll_upper", "boll_mid", "boll_lower",
+    "pct_change", "vol_ma5", "vol_ma20",
+]
+
+
+def prepare_features(df: pd.DataFrame, feature_cols: list = None):
+    """
+    准备特征矩阵：选列 → 去NaN → MinMaxScaler 归一化
+    返回: (scaled_array, scaler, feature_cols, cleaned_df)
+    """
+    if feature_cols is None:
+        feature_cols = [c for c in DEFAULT_FEATURE_COLS if c in df.columns]
+
+    data = df[feature_cols].copy()
+    data = data.replace([np.inf, -np.inf], np.nan)
+    data = data.dropna()
+
+    scaler = MinMaxScaler()
+    scaled = scaler.fit_transform(data.values)
+
+    return scaled, scaler, feature_cols, data
+
+
+def create_sequences(data: np.ndarray, look_back: int, target_col_idx: int = 0):
+    """
+    滑动窗口创建训练序列
+    data: shape (n_samples, n_features)
+    返回: X (n_seq, look_back, n_features), y (n_seq,)
+    """
+    X, y = [], []
+    for i in range(look_back, len(data)):
+        X.append(data[i - look_back:i])
+        y.append(data[i, target_col_idx])
+    return np.array(X), np.array(y)
+
+
+def time_series_split(n_samples: int, n_splits: int = 5, min_train_size: int = 100):
+    """
+    时间序列交叉验证划分（前向扩展）
+    返回: [(train_indices, val_indices), ...]
+    """
+    splits = []
+    fold_size = max(1, (n_samples - min_train_size) // (n_splits + 1))
+
+    for i in range(n_splits):
+        train_end = min_train_size + fold_size * (i + 1)
+        val_end = min(train_end + fold_size, n_samples)
+        if train_end >= n_samples or val_end <= train_end:
+            break
+        train_idx = np.arange(0, train_end)
+        val_idx = np.arange(train_end, val_end)
+        splits.append((train_idx, val_idx))
+
+    if not splits:
+        split_point = int(n_samples * 0.8)
+        splits.append((np.arange(0, split_point), np.arange(split_point, n_samples)))
+
+    return splits
+
+
+def inverse_transform_predictions(predictions: np.ndarray, scaler: MinMaxScaler,
+                                   n_features: int, target_col_idx: int = 0) -> np.ndarray:
+    """反归一化预测值回原始尺度"""
+    dummy = np.zeros((len(predictions), n_features))
+    dummy[:, target_col_idx] = predictions.flatten()
+    inversed = scaler.inverse_transform(dummy)
+    return inversed[:, target_col_idx]
