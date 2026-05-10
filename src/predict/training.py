@@ -167,36 +167,40 @@ def train_dl_model(model_name: str, X, y, config: ModelConfig,
 
 def train_arima_model(close_prices: np.ndarray, config: ModelConfig,
                       progress_callback=None) -> TrainResult:
-    """训练 ARIMA 模型"""
+    """训练 ARIMA 模型（基于收益率序列，避免随机游走问题）"""
     start = time.time()
     result = TrainResult(model_name="ARIMA")
 
     if progress_callback:
         progress_callback(0.1, "ARIMA: 拟合中...")
 
-    split_pt = int(len(close_prices) * 0.85)
-    train, test = close_prices[:split_pt], close_prices[split_pt:]
+    returns = pd.Series(close_prices).pct_change().dropna().values * 100
+
+    split_pt = int(len(returns) * 0.85)
+    train_ret, test_ret = returns[:split_pt], returns[split_pt:]
+    test_close = close_prices[split_pt + 1:]
 
     try:
-        model = fit_arima(train)
+        model = fit_arima(train_ret)
         result.model_object = model
 
-        preds = []
-        for i in range(len(test)):
+        pred_rets = []
+        for i in range(len(test_ret)):
             fc, _ = predict_arima(model, steps=1)
-            preds.append(fc[0])
-            model.update(test[i:i+1])
+            pred_rets.append(fc[0])
+            model.update(test_ret[i:i+1])
 
-        preds = np.array(preds)
-        result.test_predictions = preds
-        result.test_actuals = test
-        result.cv_metrics = calc_metrics(test, preds)
+        pred_rets = np.array(pred_rets)
+        pred_prices = returns_to_prices(close_prices[split_pt], pred_rets)
 
-        # 置信区间
-        conf_range = np.abs(preds - test)
-        avg_err = np.mean(conf_range) if len(conf_range) > 0 else 0
-        result.confidence_lower = preds - 1.96 * avg_err
-        result.confidence_upper = preds + 1.96 * avg_err
+        n = min(len(pred_prices), len(test_close))
+        result.test_predictions = pred_prices[:n]
+        result.test_actuals = test_close[:n]
+        result.cv_metrics = calc_metrics(test_close[:n], pred_prices[:n])
+
+        avg_err = np.mean(np.abs(pred_prices[:n] - test_close[:n]))
+        result.confidence_lower = pred_prices[:n] - 1.96 * avg_err
+        result.confidence_upper = pred_prices[:n] + 1.96 * avg_err
 
     except Exception as e:
         result.cv_metrics = {"mae": np.nan, "rmse": np.nan, "mape": np.nan, "r2": np.nan}
@@ -320,13 +324,14 @@ def train_all_models(df: pd.DataFrame, selected_models: list, config: ModelConfi
         result.feature_cols = feature_cols
         result.n_features = n_features
 
-        # 未来预测
+        # 未来预测（模型已在收益率上训练，预测结果也是收益率）
         try:
             if result.model_object is not None:
-                fc, conf = predict_arima(result.model_object, steps=forecast_days)
-                result.future_predictions = fc
-                result.future_conf_lower = conf[:, 0]
-                result.future_conf_upper = conf[:, 1]
+                fc_ret, conf_ret = predict_arima(result.model_object, steps=forecast_days)
+                last_price = close_arr[-1]
+                result.future_predictions = returns_to_prices(last_price, fc_ret)
+                result.future_conf_lower = returns_to_prices(last_price, conf_ret[:, 0])
+                result.future_conf_upper = returns_to_prices(last_price, conf_ret[:, 1])
         except Exception:
             result.future_predictions = np.array([])
 
