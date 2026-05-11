@@ -7,4 +7,3 @@ data/
 *.egg-info/
 .streamlit/secrets.toml
 .claude/
-scripts/train_all_stocks.py
