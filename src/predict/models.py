@@ -37,6 +37,23 @@ class ModelConfig:
     tft_n_heads: int = 4
     tft_dropout: float = 0.2
     tft_lstm_layers: int = 1
+    # CNN-GRU
+    cnn_gru_filters: list = field(default_factory=lambda: [64, 32])
+    cnn_gru_gru_units: list = field(default_factory=lambda: [64, 32])
+    cnn_gru_kernel_size: int = 3
+    # XGBoost
+    xgboost_n_estimators: int = 100
+    xgboost_max_depth: int = 6
+    xgboost_learning_rate: float = 0.1
+    xgboost_subsample: float = 0.8
+    # LightGBM
+    lightgbm_n_estimators: int = 100
+    lightgbm_max_depth: int = 6
+    lightgbm_learning_rate: float = 0.1
+    lightgbm_num_leaves: int = 31
+    # SARIMA
+    sarima_order: tuple = (1, 1, 1)
+    sarima_seasonal_order: tuple = (1, 1, 1, 5)
 
 
 def _set_seed(seed=42):
@@ -128,6 +145,46 @@ def build_cnn(config: ModelConfig):
         Dropout(config.dropout),
         Dense(1),
     ])
+
+    model = Sequential(layers)
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=config.learning_rate),
+        loss="mse",
+    )
+    return model
+
+
+def build_cnn_gru(config: ModelConfig):
+    """
+    CNN-GRU 混合模型:
+    Conv1D → MaxPool → Conv1D → MaxPool → GRU → Dropout → GRU → Dropout → Dense(1)
+    """
+    _set_seed()
+    import tensorflow as tf
+    from tensorflow.keras.models import Sequential
+    from tensorflow.keras.layers import (
+        Conv1D, MaxPooling1D, GRU, Dense, Dropout, Input
+    )
+
+    seq_len = config.look_back
+    layers = [Input(shape=(seq_len, config.n_features))]
+    layers.append(Conv1D(config.cnn_gru_filters[0], config.cnn_gru_kernel_size,
+                         activation="relu", padding="same"))
+    if seq_len >= 4:
+        layers.append(MaxPooling1D(pool_size=2))
+        seq_len //= 2
+
+    layers.append(Conv1D(config.cnn_gru_filters[1], config.cnn_gru_kernel_size,
+                         activation="relu", padding="same"))
+    if seq_len >= 4:
+        layers.append(MaxPooling1D(pool_size=2))
+
+    layers.append(GRU(config.cnn_gru_gru_units[0], return_sequences=True))
+    layers.append(Dropout(config.dropout))
+    layers.append(GRU(config.cnn_gru_gru_units[1]))
+    layers.append(Dropout(config.dropout))
+    layers.append(Dense(16, activation="relu"))
+    layers.append(Dense(1))
 
     model = Sequential(layers)
     model.compile(
@@ -340,3 +397,60 @@ def returns_to_prices(last_price: float, predicted_returns: np.ndarray) -> np.nd
     for r in predicted_returns:
         prices.append(prices[-1] * (1 + r / 100))
     return np.array(prices[1:])
+
+
+def build_xgboost(config: ModelConfig):
+    """XGBoost 回归模型"""
+    import xgboost as xgb
+    return xgb.XGBRegressor(
+        n_estimators=config.xgboost_n_estimators,
+        max_depth=config.xgboost_max_depth,
+        learning_rate=config.xgboost_learning_rate,
+        subsample=config.xgboost_subsample,
+        random_state=42,
+        n_jobs=-1,
+        verbosity=0,
+    )
+
+
+def build_lightgbm(config: ModelConfig):
+    """LightGBM 回归模型"""
+    import lightgbm as lgb
+    return lgb.LGBMRegressor(
+        n_estimators=config.lightgbm_n_estimators,
+        max_depth=config.lightgbm_max_depth,
+        learning_rate=config.lightgbm_learning_rate,
+        num_leaves=config.lightgbm_num_leaves,
+        random_state=42,
+        n_jobs=-1,
+        verbose=-1,
+    )
+
+
+def fit_sarima(train_data: np.ndarray, config: ModelConfig = None):
+    """
+    拟合 SARIMA 模型
+    train_data: 一维收盘价序列
+    """
+    from statsmodels.tsa.statespace.sarimax import SARIMAX
+    import warnings
+    warnings.filterwarnings("ignore")
+
+    order = config.sarima_order if config else (1, 1, 1)
+    seasonal_order = config.sarima_seasonal_order if config else (1, 1, 1, 5)
+
+    model = SARIMAX(train_data, order=order, seasonal_order=seasonal_order,
+                    trend='t', enforce_stationarity=False, enforce_invertibility=False)
+    result = model.fit(disp=False)
+    return result
+
+
+def predict_sarima(model, steps: int):
+    """
+    SARIMA 多步预测
+    返回: (predictions, confidence_intervals)
+    """
+    forecast = model.get_forecast(steps=steps)
+    fc = np.array(forecast.predicted_mean)
+    conf = np.array(forecast.conf_int(alpha=0.05))
+    return fc, conf

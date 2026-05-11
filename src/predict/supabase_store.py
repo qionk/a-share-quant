@@ -21,7 +21,10 @@ def _get_client():
         return None
 
     from supabase import create_client
-    return create_client(url, key)
+    from supabase.lib.client_options import SyncClientOptions
+    return create_client(url, key, options=SyncClientOptions(
+        postgrest_client_timeout=15,
+    ))
 
 
 def is_configured() -> bool:
@@ -171,20 +174,35 @@ def list_available_stocks():
         return []
 
     resp = (client.table("training_sessions")
-            .select("stock_code, stock_name, trained_at, selected_models, forecast_days")
+            .select("id, stock_code, stock_name, trained_at, selected_models, forecast_days")
             .order("trained_at", desc=True)
             .limit(50)
             .execute())
 
-    if not resp.data:
-        return []
+    return resp.data or []
 
-    seen = {}
-    for row in resp.data:
-        code = row["stock_code"]
-        if code not in seen:
-            seen[code] = row
-    return list(seen.values())
+
+def load_by_session_id(session_id):
+    client = _get_client()
+    if not client:
+        return None
+
+    resp = (client.table("training_sessions")
+            .select("*")
+            .eq("id", session_id)
+            .limit(1)
+            .execute())
+
+    if not resp.data:
+        return None
+
+    session = resp.data[0]
+    model_resp = (client.table("model_results")
+                  .select("*")
+                  .eq("session_id", session["id"])
+                  .execute())
+
+    return session, model_resp.data
 
 
 def restore_to_session_state(session_row, model_rows):

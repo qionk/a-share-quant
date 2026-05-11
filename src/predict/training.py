@@ -12,11 +12,15 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from .features import (
     compute_technical_indicators, prepare_features,
     create_sequences, time_series_split, inverse_transform_predictions,
+    create_tabular_features, create_tabular_targets,
     DEFAULT_FEATURE_COLS,
 )
 from .models import (
-    ModelConfig, build_lstm, build_gru, build_cnn, build_patchtst, build_tft,
-    fit_arima, predict_arima, fit_egarch, predict_egarch, returns_to_prices,
+    ModelConfig, build_lstm, build_gru, build_cnn, build_cnn_gru,
+    build_patchtst, build_tft,
+    fit_arima, predict_arima, fit_egarch, predict_egarch,
+    fit_sarima, predict_sarima,
+    build_xgboost, build_lightgbm, returns_to_prices,
 )
 
 
@@ -29,9 +33,18 @@ class TrainingCallbacks:
     def on_model_start(self, model_name: str, model_index: int, total_models: int) -> None:
         pass
 
+    def on_fold_start(self, model_name: str, fold: int, total_folds: int) -> None:
+        pass
+
+    def on_fold_end(self, model_name: str, fold: int, fold_metrics: dict) -> None:
+        pass
+
     def on_epoch_end(self, model_name: str, epoch: int, total_epochs: int,
                      train_loss: float, val_loss: float, lr: float,
                      grad_norm: float = None) -> None:
+        pass
+
+    def on_early_stop(self, model_name: str, epoch: int, best_epoch: int) -> None:
         pass
 
     def on_model_end(self, model_name: str, result) -> None:
@@ -42,6 +55,9 @@ class TrainingCallbacks:
 
     def on_overfitting_warning(self, model_name: str, epoch: int,
                                 val_loss: float, best_val_loss: float) -> None:
+        pass
+
+    def on_log(self, message: str) -> None:
         pass
 
 
@@ -175,6 +191,11 @@ def _train_dl_model(model, X_train, y_train, X_val, y_val, config: ModelConfig,
         callbacks=keras_callbacks,
         verbose=0,
     )
+
+    actual_epochs = len(history.history.get("loss", []))
+    if callbacks and actual_epochs < config.epochs:
+        best_epoch = actual_epochs - config.early_stop_patience
+        callbacks.on_early_stop(model_name, actual_epochs, max(1, best_epoch))
     return {k: [float(v) for v in vals] for k, vals in history.history.items()}
 
 
@@ -200,7 +221,7 @@ def train_dl_model(model_name: str, X, y, config: ModelConfig,
     result = TrainResult(model_name=model_name)
 
     builders = {"LSTM": build_lstm, "GRU": build_gru, "1D-CNN": build_cnn,
-                "PatchTST": build_patchtst, "TFT": build_tft}
+            "CNN-GRU": build_cnn_gru, "PatchTST": build_patchtst, "TFT": build_tft}
     build_fn = builders[model_name]
 
     split_pt = int(len(X) * 0.85)
@@ -209,14 +230,11 @@ def train_dl_model(model_name: str, X, y, config: ModelConfig,
 
     if quick:
         # 快速模式: 跳过CV，直接训练一次
-        import sys as _sys
-        print(f"[DEBUG] {model_name}: build model...", flush=True, file=_sys.stderr)
         final_model = build_fn(config)
-        print(f"[DEBUG] {model_name}: params={final_model.count_params()}, start fit...", flush=True, file=_sys.stderr)
-        # 快速模式不传 callbacks，避免 Streamlit UI 更新拖慢训练
+        if callbacks:
+            callbacks.on_log(f"[{model_name}] 快速模式 | 参数量: {final_model.count_params():,} | 训练集: {len(X_train)}, 测试集: {len(X_test)}")
         final_hist = _train_dl_model(final_model, X_train, y_train, X_test, y_test, config,
-                                      model_name=model_name, callbacks=None)
-        print(f"[DEBUG] {model_name}: fit done, predict...", flush=True, file=_sys.stderr)
+                                      model_name=model_name, callbacks=callbacks)
         result.train_history = final_hist
         result.model_object = final_model
 
@@ -225,8 +243,8 @@ def train_dl_model(model_name: str, X, y, config: ModelConfig,
         result.test_predictions = y_pred
         result.test_actuals = y_test
 
-        # 快速模式: MC Dropout 仅 10 次
-        print(f"[DEBUG] {model_name}: MC dropout...", flush=True, file=_sys.stderr)
+        if callbacks:
+            callbacks.on_log(f"[{model_name}] MC Dropout 置信区间估算中...")
         _, lower, upper = _mc_dropout_predict(final_model, X_test, n_iter=10)
         result.confidence_lower = lower
         result.confidence_upper = upper
@@ -235,7 +253,12 @@ def train_dl_model(model_name: str, X, y, config: ModelConfig,
         splits = time_series_split(len(X), n_splits=n_splits)
         cv_scores = []
 
+        if callbacks:
+            callbacks.on_log(f"[{model_name}] 正常模式 | {n_splits}折交叉验证 | 训练集: {len(X_train)}, 测试集: {len(X_test)}")
+
         for fold_i, (train_idx, val_idx) in enumerate(splits):
+            if callbacks:
+                callbacks.on_fold_start(model_name, fold_i + 1, n_splits)
             X_tr, y_tr = X[train_idx], y[train_idx]
             X_vl, y_vl = X[val_idx], y[val_idx]
 
@@ -246,20 +269,31 @@ def train_dl_model(model_name: str, X, y, config: ModelConfig,
             y_pred = model.predict(X_vl, verbose=0).flatten()
             fold_metrics = calc_metrics(y_vl, y_pred)
             cv_scores.append(fold_metrics)
+            if callbacks:
+                callbacks.on_fold_end(model_name, fold_i + 1, fold_metrics)
 
         result.cv_metrics = {
             k: np.mean([s[k] for s in cv_scores if not np.isnan(s[k])])
             for k in ["mae", "rmse", "mape", "r2"]
         }
 
+        if callbacks:
+            callbacks.on_log(
+                f"[{model_name}] CV完成 | RMSE={result.cv_metrics['rmse']:.4f}, "
+                f"R²={result.cv_metrics['r2']:.4f} | 开始全量训练...")
+
         # 全量训练最终模型
         final_model = build_fn(config)
+        if callbacks:
+            callbacks.on_log(f"[{model_name}] 最终模型参数量: {final_model.count_params():,}")
         final_hist = _train_dl_model(final_model, X_train, y_train, X_test, y_test, config,
                                       model_name=model_name, callbacks=callbacks)
         result.train_history = final_hist
         result.model_object = final_model
 
         # 测试集预测 + 置信区间
+        if callbacks:
+            callbacks.on_log(f"[{model_name}] MC Dropout 置信区间估算中...")
         mean_pred, lower, upper = _mc_dropout_predict(final_model, X_test)
         result.test_predictions = mean_pred
         result.test_actuals = y_test
@@ -384,6 +418,247 @@ def train_egarch_model(returns: np.ndarray, close_prices: np.ndarray,
     return result
 
 
+def validate_training_data(df: pd.DataFrame, config: ModelConfig = None):
+    """
+    训练前数据质量检查。
+    返回: (passed: bool, warnings: list, errors: list)
+    """
+    warnings = []
+    errors = []
+
+    min_rows_warn = 200
+    if len(df) < min_rows_warn:
+        msg = f"数据量仅 {len(df)} 天 (建议 >= {min_rows_warn})"
+        warnings.append(msg)
+    if len(df) < 50:
+        errors.append(f"数据量仅 {len(df)} 天 (最低要求 50)")
+
+    if "close" in df.columns:
+        close = df["close"]
+        close_na = close.isna().sum() / len(df)
+        if close_na > 0.05:
+            warnings.append(f"收盘价缺失率 {close_na:.1%} (偏高)")
+        if close_na > 0.3:
+            errors.append(f"收盘价缺失率 {close_na:.1%} (过高)")
+
+        if (close < 0).any():
+            errors.append(f"存在 {(close < 0).sum()} 个负收盘价")
+
+        # ADF 平稳性检验
+        if len(df) > 100:
+            try:
+                from statsmodels.tsa.stattools import adfuller
+                adf_p = adfuller(close.dropna(), maxlag=10)[1]
+                if adf_p > 0.05:
+                    warnings.append(f"收盘价非平稳 (ADF p={adf_p:.3f})，趋势模型可能更合适")
+            except Exception:
+                pass
+
+    passed = len(errors) == 0
+    return passed, warnings, errors
+
+
+# ── 树模型训练（XGBoost / LightGBM）─────────────────────────────────────
+
+def _prepare_tabular_data(scaled_data, feature_cols, look_back):
+    """准备表格特征，并分割训练/测试集"""
+    X, feature_names = create_tabular_features(scaled_data, feature_cols, look_back)
+    y = create_tabular_targets(scaled_data, look_back, 0)
+
+    split_pt = int(len(X) * 0.85)
+    return (X[:split_pt], X[split_pt:],
+            y[:split_pt], y[split_pt:],
+            feature_names)
+
+
+def _bootstrap_ci(model, X, n_iter=100):
+    """树模型置信区间：特征扰动法"""
+    preds = []
+    rng = np.random.RandomState(42)
+    for _ in range(n_iter):
+        noise = rng.normal(0, 0.01, X.shape)
+        p = model.predict(X + noise)
+        preds.append(p)
+    preds = np.array(preds)
+    mean = preds.mean(axis=0)
+    std = preds.std(axis=0)
+    return mean, mean - 1.96 * std, mean + 1.96 * std
+
+
+def _predict_future_tree(model, last_features, steps, scaler, n_features,
+                          feature_names):
+    """
+    树模型自回归多步预测。
+    last_features: 1D array shape (n_features * look_back,)
+    """
+    predictions = []
+    current = last_features.copy()
+    n_lag_features = len(feature_names)
+
+    for _ in range(steps):
+        pred_scaled = model.predict(current.reshape(1, -1))[0]
+        predictions.append(pred_scaled)
+
+        # 窗口前移：去掉最早的 n_features 个值，把当前预测作为新的 target
+        new_lag = current[-n_features:].copy()
+        new_lag[0] = pred_scaled  # target_col=0 (close)
+        current = np.concatenate([current[n_features:], new_lag])
+
+    preds = np.array(predictions)
+    return inverse_transform_predictions(preds, scaler, n_features, 0)
+
+
+def train_tree_model(model_name, X_seq, y_seq, config, callbacks=None) -> TrainResult:
+    """
+    训练树模型（XGBoost / LightGBM）。
+    X_seq, y_seq: 归一化后的 3D 序列和 1D 目标
+    """
+    start = time.time()
+    result = TrainResult(model_name=model_name)
+
+    builders = {"XGBoost": build_xgboost, "LightGBM": build_lightgbm}
+    build_fn = builders.get(model_name)
+
+    if not build_fn:
+        result.train_history = {"error": f"未知树模型: {model_name}"}
+        return result
+
+    model = build_fn(config)
+
+    if callbacks:
+        callbacks.on_log(f"[{model_name}] 树模型训练 | 开始准备表格特征...")
+
+    try:
+        # 准备表格数据（用归一化后的特征）
+        # 注意：这里需要 scaled_data 和 feature_cols，需要从外层传入
+        # 暂时用占位符，实际在 train_all_models 中已准备好 scaled, feature_cols
+        result.model_object = model
+        result.train_history = {}
+        result.cv_metrics = {"mae": np.nan, "rmse": np.nan, "mape": np.nan, "r2": np.nan}
+    except Exception as e:
+        result.train_history = {"error": str(e)}
+
+    result.training_time = time.time() - start
+    return result
+
+
+def _train_tree_model_full(model, X_train, y_train, X_test, y_test,
+                            config, model_name, callbacks) -> TrainResult:
+    """树模型完整训练流程（含CV）"""
+    start = time.time()
+    result = TrainResult(model_name=model_name)
+
+    if callbacks:
+        callbacks.on_log(f"[{model_name}] 树模型 | 训练集: {len(X_train)}, 测试集: {len(X_test)}")
+
+    # CV
+    folds = time_series_split(len(X_train), n_splits=3)
+    fold_metrics = []
+    for fi, (tr_idx, vl_idx) in enumerate(folds):
+        if callbacks:
+            callbacks.on_fold_start(model_name, fi + 1, len(folds))
+        X_fold_tr, X_fold_vl = X_train[tr_idx], X_train[vl_idx]
+        y_fold_tr, y_fold_vl = y_train[tr_idx], y_train[vl_idx]
+
+        m = build_xgboost(config) if model_name == "XGBoost" else build_lightgbm(config)
+        m.fit(X_fold_tr, y_fold_tr)
+        y_pred_vl = m.predict(X_fold_vl)
+        fm = calc_metrics(y_fold_vl, y_pred_vl)
+        fold_metrics.append(fm)
+        if callbacks:
+            callbacks.on_fold_end(model_name, fi + 1, fm)
+
+    if fold_metrics:
+        avg_metrics = {}
+        for k in fold_metrics[0]:
+            vals = [fm[k] for fm in fold_metrics if not np.isnan(fm[k])]
+            avg_metrics[k] = np.mean(vals) if vals else np.nan
+        result.cv_metrics = avg_metrics
+    else:
+        result.cv_metrics = {"mae": np.nan, "rmse": np.nan, "mape": np.nan, "r2": np.nan}
+
+    if callbacks:
+        callbacks.on_log(f"[{model_name}] CV完成 | MAE: {result.cv_metrics.get('mae', np.nan):.4f}")
+
+    # 最终训练
+    final_model = build_xgboost(config) if model_name == "XGBoost" else build_lightgbm(config)
+    final_model.fit(X_train, y_train)
+    result.model_object = final_model
+
+    # 测试集评估
+    y_pred = final_model.predict(X_test)
+    test_metrics = calc_metrics(y_test, y_pred)
+    result.test_predictions = y_pred
+    result.test_actuals = y_test
+
+    mean_ci, lower_ci, upper_ci = _bootstrap_ci(final_model, X_test)
+    result.confidence_lower = lower_ci
+    result.confidence_upper = upper_ci
+
+    if callbacks:
+        callbacks.on_log(f"[{model_name}] 测试 MAE: {test_metrics.get('mae', np.nan):.4f}")
+
+    result.train_history = {}
+    result.training_time = time.time() - start
+    return result
+
+
+# ── SARIMA 训练 ─────────────────────────────────────────────────
+
+def train_sarima_model(close_prices, config, progress_callback=None) -> TrainResult:
+    """
+    训练 SARIMA 模型（滚动一步预测）
+    与 train_arima_model 相同模式但使用 SARIMAX
+    """
+    import warnings
+    warnings.filterwarnings("ignore")
+
+    start = time.time()
+    result = TrainResult(model_name="SARIMA")
+
+    if progress_callback:
+        progress_callback(0.1, "SARIMA: 拟合中...")
+
+    split_pt = int(len(close_prices) * 0.85)
+    train_close = close_prices[:split_pt]
+    test_close = close_prices[split_pt:]
+
+    try:
+        model = fit_sarima(train_close, config)
+        result.model_object = model
+
+        # 滚动一步预测
+        from statsmodels.tsa.statespace.sarimax import SARIMAX
+        history = list(train_close)
+        pred_prices = []
+        for i in range(len(test_close)):
+            m = SARIMAX(history, order=config.sarima_order,
+                        seasonal_order=config.sarima_seasonal_order,
+                        trend='t', enforce_stationarity=False,
+                        enforce_invertibility=False)
+            res = m.fit(disp=False)
+            fc = np.array(res.get_forecast(steps=1).predicted_mean)[0]
+            pred_prices.append(fc)
+            history.append(test_close[i])
+
+        pred_prices = np.array(pred_prices)
+        result.test_predictions = pred_prices
+        result.test_actuals = test_close
+        result.cv_metrics = calc_metrics(test_close, pred_prices)
+        result.model_object = res
+
+        avg_err = np.mean(np.abs(pred_prices - test_close))
+        result.confidence_lower = pred_prices - 1.96 * avg_err
+        result.confidence_upper = pred_prices + 1.96 * avg_err
+
+    except Exception as e:
+        result.cv_metrics = {"mae": np.nan, "rmse": np.nan, "mape": np.nan, "r2": np.nan}
+        result.train_history = {"error": str(e)}
+
+    result.training_time = time.time() - start
+    return result
+
+
 def train_all_models(df: pd.DataFrame, selected_models: list, config: ModelConfig,
                      forecast_days: int = 5, progress_callback=None,
                      callbacks: TrainingCallbacks = None,
@@ -399,6 +674,14 @@ def train_all_models(df: pd.DataFrame, selected_models: list, config: ModelConfi
 
     df_ind = compute_technical_indicators(df)
     scaled, scaler, feature_cols, cleaned_df = prepare_features(df_ind)
+
+    # 训练前数据质量检查
+    passed, val_warnings, val_errors = validate_training_data(cleaned_df, config)
+    if callbacks:
+        for w in val_warnings:
+            callbacks.on_log(f"[数据质量] 警告: {w}")
+        for e in val_errors:
+            callbacks.on_log(f"[数据质量] 错误: {e}")
 
     # 快速模式: 只用 5 个核心特征，大幅减少计算量
     if quick:
@@ -427,19 +710,21 @@ def train_all_models(df: pd.DataFrame, selected_models: list, config: ModelConfi
 
     X, y = create_sequences(scaled, config.look_back, target_col_idx=0)
 
-    import sys as _sys
-    print(f"[DEBUG] quick={quick}, features={n_features}, X.shape={X.shape}, "
-          f"epochs={config.epochs}, patience={config.early_stop_patience}", flush=True, file=_sys.stderr)
-
     results = {}
-    dl_models = [m for m in selected_models if m in ("LSTM", "GRU", "1D-CNN", "PatchTST", "TFT")]
-    stat_models = [m for m in selected_models if m in ("ARIMA", "EGARCH")]
+    dl_models = [m for m in selected_models if m in ("LSTM", "GRU", "1D-CNN", "CNN-GRU", "PatchTST", "TFT")]
+    tree_models = [m for m in selected_models if m in ("XGBoost", "LightGBM")]
+    stat_models = [m for m in selected_models if m in ("ARIMA", "EGARCH", "SARIMA")]
+    all_ordered = dl_models + tree_models + stat_models
 
     total = len(selected_models)
     done = 0
 
     if callbacks:
         callbacks.on_training_start(selected_models)
+        mode_str = "快速模式" if quick else "正常模式"
+        callbacks.on_log(
+            f"数据准备完成 | {mode_str} | 样本数: {X.shape[0]}, 特征: {n_features}, "
+            f"时间步: {config.look_back} | Epochs: {config.epochs}")
 
     for name in dl_models:
         if callbacks:
@@ -481,11 +766,58 @@ def train_all_models(df: pd.DataFrame, selected_models: list, config: ModelConfi
         results[name] = result
         done += 1
 
+    # ── 树模型训练 ───────────────────────────────────
+    for name in tree_models:
+        if callbacks:
+            callbacks.on_model_start(name, done, total)
+            callbacks.on_log(f"[{name}] 表格特征: {n_features * config.look_back} 维")
+
+        try:
+            X_tab_train, X_tab_test, y_tab_train, y_tab_test, tab_feature_names = \
+                _prepare_tabular_data(scaled, feature_cols, config.look_back)
+
+            result = _train_tree_model_full(
+                name, X_tab_train, y_tab_train, X_tab_test, y_tab_test,
+                config=config, model_name=name, callbacks=callbacks)
+            result.scaler = scaler
+            result.feature_cols = tab_feature_names
+            result.n_features = n_features
+
+            # 反归一化
+            result.test_predictions = inverse_transform_predictions(
+                result.test_predictions, scaler, n_features, 0)
+            result.test_actuals = inverse_transform_predictions(
+                result.test_actuals, scaler, n_features, 0)
+            result.confidence_lower = inverse_transform_predictions(
+                result.confidence_lower, scaler, n_features, 0)
+            result.confidence_upper = inverse_transform_predictions(
+                result.confidence_upper, scaler, n_features, 0)
+            result.cv_metrics = calc_metrics(result.test_actuals, result.test_predictions)
+
+            # 未来预测
+            last_tab_features = X_tab_train[-1].copy()
+            future_preds = _predict_future_tree(
+                result.model_object, last_tab_features, forecast_days,
+                scaler, n_features, tab_feature_names)
+            result.future_predictions = future_preds
+
+        except Exception as e:
+            result = TrainResult(model_name=name)
+            result.cv_metrics = {"mae": np.nan, "rmse": np.nan, "mape": np.nan, "r2": np.nan}
+            result.train_history = {"error": str(e)}
+            result.training_time = time.time()
+
+        if callbacks:
+            callbacks.on_model_end(name, result)
+        results[name] = result
+        done += 1
+
     close_arr = cleaned_df["close"].values if "close" in cleaned_df.columns else df["close"].dropna().values
 
     if "ARIMA" in stat_models:
         if callbacks:
             callbacks.on_model_start("ARIMA", done, total)
+            callbacks.on_log(f"[ARIMA] 滚动一步预测 | 数据: {len(close_arr)} 天")
         result = train_arima_model(close_arr, config, progress_callback=None)
         result.scaler = scaler
         result.feature_cols = feature_cols
@@ -508,6 +840,7 @@ def train_all_models(df: pd.DataFrame, selected_models: list, config: ModelConfi
     if "EGARCH" in stat_models:
         if callbacks:
             callbacks.on_model_start("EGARCH", done, total)
+            callbacks.on_log(f"[EGARCH] 波动率建模 | 收益率序列: {len(pd.Series(close_arr).pct_change().dropna())} 天")
         returns = pd.Series(close_arr).pct_change().dropna().values * 100
         result = train_egarch_model(returns, close_arr, config, progress_callback=None)
         result.scaler = scaler
@@ -526,6 +859,29 @@ def train_all_models(df: pd.DataFrame, selected_models: list, config: ModelConfi
         if callbacks:
             callbacks.on_model_end("EGARCH", result)
         results["EGARCH"] = result
+        done += 1
+
+    if "SARIMA" in stat_models:
+        if callbacks:
+            callbacks.on_model_start("SARIMA", done, total)
+            callbacks.on_log(f"[SARIMA] 季节性ARIMA | 数据: {len(close_arr)} 天")
+        result = train_sarima_model(close_arr, config)
+        result.scaler = scaler
+        result.feature_cols = feature_cols
+        result.n_features = n_features
+
+        try:
+            if result.model_object is not None:
+                fc, conf = predict_sarima(result.model_object, steps=forecast_days)
+                result.future_predictions = fc
+                result.future_conf_lower = conf[:, 0]
+                result.future_conf_upper = conf[:, 1]
+        except Exception:
+            result.future_predictions = np.array([])
+
+        if callbacks:
+            callbacks.on_model_end("SARIMA", result)
+        results["SARIMA"] = result
         done += 1
 
     if callbacks:

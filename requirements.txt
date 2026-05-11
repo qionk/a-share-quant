@@ -17,3 +17,6 @@ xlsxwriter>=3.1.0
 kaleido>=0.2.1
 statsmodels>=0.14.0
 supabase>=2.0.0
+pymysql>=1.1.0
+xgboost>=2.0.0
+lightgbm>=4.0.0

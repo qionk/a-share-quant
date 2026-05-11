@@ -41,7 +41,7 @@ def save_model(stock_code: str, model_name: str, train_result,
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     base_name = f"{model_name}_{timestamp}"
 
-    if model_name in ("LSTM", "GRU", "1D-CNN"):
+    if model_name in ("LSTM", "GRU", "1D-CNN", "CNN-GRU"):
         model_path = os.path.join(model_dir, f"{base_name}.keras")
         train_result.model_object.save(model_path)
     else:

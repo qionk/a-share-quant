@@ -52,6 +52,21 @@ def compute_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["vol_ma5"] = volume.rolling(5).mean()
     df["vol_ma20"] = volume.rolling(20).mean()
 
+    # OBV (On-Balance Volume)
+    df["obv"] = (np.sign(close.diff()) * volume).fillna(0).cumsum()
+
+    # 量比 (volume / vol_ma20)
+    df["vol_ratio"] = volume / df["vol_ma20"].replace(0, np.nan)
+
+    # VWAP 近似
+    df["vwap"] = (close * volume).cumsum() / volume.cumsum()
+
+    # 量价相关性 (20日滚动)
+    df["vol_price_corr"] = volume.rolling(20).corr(close)
+
+    # 成交量动量 (5日变化率)
+    df["vol_momentum"] = volume.pct_change(5) * 100
+
     return df
 
 
@@ -62,6 +77,7 @@ DEFAULT_FEATURE_COLS = [
     "dif", "dea", "macd", "rsi",
     "boll_upper", "boll_mid", "boll_lower",
     "pct_change", "vol_ma5", "vol_ma20",
+    "obv", "vol_ratio", "vwap", "vol_price_corr", "vol_momentum",
 ]
 
 
@@ -127,3 +143,31 @@ def inverse_transform_predictions(predictions: np.ndarray, scaler: MinMaxScaler,
     dummy[:, target_col_idx] = predictions.flatten()
     inversed = scaler.inverse_transform(dummy)
     return inversed[:, target_col_idx]
+
+
+def create_tabular_features(scaled_data: np.ndarray, feature_cols: list,
+                             look_back: int) -> tuple:
+    """
+    将3D序列数据展平为2D表格特征（用于XGBoost/LightGBM等树模型）。
+    每个时间步的特征都作为独立的lag列。
+    返回: (X_2D, feature_names)
+    """
+    n_features = len(feature_cols)
+    X, y = [], []
+    for i in range(look_back, len(scaled_data)):
+        row = scaled_data[i - look_back:i].flatten()
+        X.append(row)
+    X = np.array(X)
+
+    feature_names = []
+    for col in feature_cols:
+        for lag in range(look_back, 0, -1):
+            feature_names.append(f"{col}_lag{lag}")
+
+    return X, feature_names
+
+
+def create_tabular_targets(scaled_data: np.ndarray, look_back: int,
+                            target_col_idx: int = 0) -> np.ndarray:
+    """提取表格数据的目标值（归一化后的close价格）"""
+    return scaled_data[look_back:, target_col_idx]

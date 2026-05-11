@@ -1,7 +1,7 @@
 """
 A股价格预测工具
 ==============
-功能: 5种模型(LSTM/GRU/1D-CNN/ARIMA/EGARCH)预测A股个股未来收盘价
+功能: 11种模型(LSTM/GRU/1D-CNN/CNN-GRU/PatchTST/TFT/XGBoost/LightGBM/ARIMA/SARIMA/EGARCH)预测A股个股未来收盘价
 启动: streamlit run predict_app.py
 依赖: pip install -r requirements.txt
 """
@@ -29,17 +29,29 @@ from src.predict.models import ModelConfig
 from src.predict.training import (
     train_all_models, compute_ensemble_weights, ensemble_predict,
     calc_metrics, backtest_predictions, TrainingCallbacks,
+    validate_training_data,
 )
 from src.predict.model_store import save_model, list_models, delete_model, load_model
 from src.predict.continuous import (
     rolling_train, track_performance, should_retrain, get_model_status, cleanup_old_models,
 )
-from src.predict.supabase_store import (
-    is_configured as supabase_configured,
-    save_training_results as supabase_save,
-    load_latest_results as supabase_load,
-    list_available_stocks as supabase_list_stocks,
-    restore_to_session_state as supabase_restore,
+from src.predict.mysql_store import (
+    is_configured as cloud_configured,
+    save_training_results as cloud_save,
+    load_by_session_id as cloud_load_session,
+    list_available_stocks as cloud_list_stocks,
+    restore_to_session_state as cloud_restore,
+)
+from src.predict.stock_data_store import (
+    list_db_stocks, load_stock_from_db, fetch_and_store, has_stock_data,
+    list_stocks_with_status, list_stock_sessions,
+)
+from src.predict.price_limits import (
+    detect_price_limit_pct, get_board_name, apply_price_limits,
+)
+from src.predict.fibonacci import (
+    calculate_fibonacci_levels, generate_fibonacci_signals,
+    FIB_LEVELS, FIB_NAMES, FIB_COLORS,
 )
 from src.data import load_config
 
@@ -47,7 +59,7 @@ from src.data import load_config
 
 st.set_page_config(page_title="A股价格预测", page_icon="📈", layout="wide")
 st.title("A股价格预测工具")
-st.caption("支持 LSTM / GRU / 1D-CNN / PatchTST / TFT / ARIMA / EGARCH 多模型集成预测")
+st.caption("支持 LSTM / GRU / 1D-CNN / CNN-GRU / PatchTST / TFT / XGBoost / LightGBM / ARIMA / SARIMA / EGARCH 多模型集成预测")
 
 config = load_config()
 predict_cfg = config.get("predict", {})
@@ -150,46 +162,199 @@ def _deserialize_results(content: bytes):
 
 # ═══════ Session State 初始化 ═══════
 
+TRAINING_LOCK = os.path.join(ROOT, "models", ".training_lock.json")
+
 for key in ["stock_data", "stock_code", "stock_name", "train_results",
             "ensemble_weights", "predictions", "training_active"]:
     if key not in st.session_state:
         st.session_state[key] = None
 if "training_active" not in st.session_state:
     st.session_state.training_active = False
+if "cloud_stocks_cache" not in st.session_state:
+    st.session_state.cloud_stocks_cache = None
+    st.session_state.cloud_stocks_ts = 0
+if "db_stocks" not in st.session_state:
+    st.session_state.db_stocks = []
+
+
+def _training_lock_read():
+    if os.path.exists(TRAINING_LOCK):
+        import json as _json
+        with open(TRAINING_LOCK) as f:
+            return _json.load(f)
+    return None
+
+
+def _training_lock_write(data):
+    os.makedirs(os.path.dirname(TRAINING_LOCK), exist_ok=True)
+    import json as _json
+    with open(TRAINING_LOCK, "w") as f:
+        _json.dump(data, f)
+
+
+def _training_lock_clear():
+    if os.path.exists(TRAINING_LOCK):
+        os.remove(TRAINING_LOCK)
+
+
+def _check_orphaned_training():
+    lock = _training_lock_read()
+    if not lock:
+        return None
+    pid = lock.get("pid")
+    if pid:
+        try:
+            os.kill(pid, 0)  # 不发送信号，只检查存在性
+            return "running"
+        except OSError:
+            pass
+    _training_lock_clear()
+    return "orphaned"
+
+
+orphan_status = _check_orphaned_training()
+if orphan_status == "running":
+    st.session_state.training_active = True
+elif orphan_status == "orphaned":
+    st.session_state.training_active = False
+    st.warning("检测到上次训练中断（可能刷新了页面），已自动重置训练状态")
+
 
 # ═══════ 侧边栏 ═══════
+
+btn_train = False
 
 with st.sidebar:
     st.header("配置参数")
 
     # 数据来源
     st.subheader("数据输入")
-    data_source = st.radio("数据来源", ["API自动获取", "Excel上传"], horizontal=True)
+    data_source = st.radio("数据来源", ["数据库加载", "Excel上传"], horizontal=True)
 
-    if data_source == "API自动获取":
-        stock_code = st.text_input("股票代码（6位）", value="603601")
-        col1, col2 = st.columns(2)
-        with col1:
-            start_date = st.date_input("开始日期", value=datetime(2020, 1, 1))
-        with col2:
-            end_date = st.date_input("结束日期", value=datetime.now())
+    if data_source == "数据库加载":
+        if st.button("刷新列表", key="refresh_db_stocks"):
+            try:
+                st.session_state.db_stocks = list_stocks_with_status()
+            except Exception as e:
+                st.error(f"加载失败: {e}")
 
-        if st.button("获取数据", type="primary", use_container_width=True):
-            with st.spinner("正在获取数据..."):
-                try:
-                    df = load_from_akshare(
-                        stock_code,
-                        start_date.strftime("%Y%m%d"),
-                        end_date.strftime("%Y%m%d"),
-                    )
-                    st.session_state.stock_data = df
-                    st.session_state.stock_code = stock_code
-                    st.session_state.stock_name = get_stock_name(stock_code)
-                    st.session_state.train_results = None
-                    st.session_state.predictions = None
-                    st.success(f"获取成功: {len(df)} 条数据")
-                except Exception as e:
-                    st.error(f"获取失败: {e}")
+        if not st.session_state.db_stocks:
+            try:
+                st.session_state.db_stocks = list_stocks_with_status()
+            except Exception:
+                pass
+
+        if st.session_state.db_stocks:
+            stock_list = st.session_state.db_stocks
+            stock_labels = {}
+            for s in stock_list:
+                # 数据新鲜度
+                from datetime import date
+                today_str = date.today().strftime("%Y-%m-%d")
+                end_date = s["end_date"]
+                if end_date == today_str:
+                    freshness = "最新"
+                elif end_date >= today_str:
+                    freshness = "最新"
+                else:
+                    days_behind = (date.today() - date.fromisoformat(end_date)).days
+                    freshness = f"{days_behind}天前"
+                data_part = f"{s['name']} ({s['code']})  {s['rows']}天  最新: {s['end_date']} ({freshness})"
+                if s["trained"]:
+                    models = ", ".join(s.get("trained_models", []))
+                    train_part = f"  |  已训练: {models}"
+                else:
+                    train_part = "  |  未训练"
+                stock_labels[data_part + train_part] = s
+
+            selected_label = st.selectbox(
+                "选择股票", options=list(stock_labels.keys()), key="db_stock_select",
+                label_visibility="collapsed",
+            )
+            if selected_label:
+                info = stock_labels[selected_label]
+
+                # 训练版本选择
+                selected_session_id = None
+                if info["trained"]:
+                    sessions = list_stock_sessions(info["code"])
+                    if sessions:
+                        if len(sessions) == 1:
+                            selected_session_id = sessions[0]["session_id"]
+                            s = sessions[0]
+                            models = ", ".join(s.get("trained_models", []))
+                            st.caption(f"训练记录: {s['trained_at']}  {models}")
+                        else:
+                            session_labels = {}
+                            for s in sessions:
+                                models = ", ".join(s.get("trained_models", []))
+                                session_labels[f"{s['trained_at']}  {models}"] = s
+                            selected_session = st.selectbox(
+                                "训练版本", options=list(session_labels.keys()),
+                                index=0, key=f"session_{info['code']}",
+                            )
+                            selected_session_id = session_labels[selected_session]["session_id"]
+
+                if st.button("加载", type="primary", use_container_width=True, key="load_db_btn"):
+                    with st.spinner(f"加载 {info['name']}...并检查数据更新..."):
+                        try:
+                            from datetime import date as _date
+                            _is_fresh = info["end_date"] >= _date.today().strftime("%Y-%m-%d")
+                            if not _is_fresh:
+                                st.toast(f"正在更新 {info['name']} 的数据...")
+                            df, _, _ = fetch_and_store(info["code"])
+                            st.session_state.stock_data = df
+                            st.session_state.stock_code = info["code"]
+                            st.session_state.stock_name = info["name"]
+
+                            if selected_session_id:
+                                try:
+                                    result = cloud_load_session(selected_session_id)
+                                    if result:
+                                        cloud_restore(result[0], result[1])
+                                    else:
+                                        st.session_state.train_results = None
+                                        st.session_state.predictions = None
+                                except Exception:
+                                    st.session_state.train_results = None
+                                    st.session_state.predictions = None
+                            else:
+                                st.session_state.train_results = None
+                                st.session_state.predictions = None
+
+                            st.success(f"加载成功: {len(df)} 条")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"加载失败: {e}")
+        else:
+            st.info("暂无数据，请先获取股票")
+
+        st.divider()
+        st.caption("添加新股")
+        new_code = st.text_input("股票代码", key="new_stock_code", placeholder="6位代码")
+        if new_code and len(new_code) == 6:
+            exists = False
+            try:
+                exists = has_stock_data(new_code) or any(s["code"] == new_code for s in st.session_state.db_stocks)
+            except Exception:
+                pass
+            if exists:
+                st.info("该股票数据已存在，刷新列表即可看到")
+            else:
+                if st.button("获取数据", type="primary", use_container_width=True, key="fetch_new_btn"):
+                    with st.spinner(f"正在获取 {new_code} 数据..."):
+                        try:
+                            df, name, _ = fetch_and_store(new_code)
+                            st.session_state.stock_data = df
+                            st.session_state.stock_code = new_code
+                            st.session_state.stock_name = name
+                            st.session_state.train_results = None
+                            st.session_state.predictions = None
+                            st.success(f"获取成功: {name} ({len(df)} 条)")
+                            st.session_state.db_stocks = list_stocks_with_status()
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"获取失败: {e}")
 
     else:
         st.download_button(
@@ -214,67 +379,15 @@ with st.sidebar:
 
     st.divider()
 
-    # 恢复历史结果
-    st.subheader("恢复历史结果")
-    uploaded_result = st.file_uploader("上传之前导出的结果文件", type=["json"], key="result_upload")
-    if uploaded_result and st.button("恢复结果", use_container_width=True):
-        try:
-            _deserialize_results(uploaded_result.read())
-            st.success("恢复成功！")
-            st.rerun()
-        except Exception as e:
-            st.error(f"恢复失败: {e}")
-
-    st.divider()
-
-    # 云端训练结果
-    st.subheader("云端训练结果")
-    if supabase_configured():
-        try:
-            cloud_stocks = supabase_list_stocks()
-        except Exception:
-            cloud_stocks = []
-
-        if cloud_stocks:
-            cloud_options = {
-                f"{s['stock_name'] or s['stock_code']} ({s['stock_code']}) - {s['trained_at'][:10]}": s
-                for s in cloud_stocks
-            }
-            selected_cloud = st.selectbox(
-                "选择已有结果", options=list(cloud_options.keys()), key="cloud_select"
-            )
-            if selected_cloud:
-                info = cloud_options[selected_cloud]
-                models_str = ", ".join(info.get("selected_models", []))
-                st.caption(f"模型: {models_str} | 预测{info.get('forecast_days', '?')}天")
-
-            if st.button("加载云端结果", use_container_width=True):
-                try:
-                    info = cloud_options[selected_cloud]
-                    result = supabase_load(info["stock_code"])
-                    if result:
-                        supabase_restore(result[0], result[1])
-                        st.success("云端结果加载成功！")
-                        st.rerun()
-                    else:
-                        st.warning("未找到该股票的云端结果")
-                except Exception as e:
-                    err_msg = str(e)
-                    if "403" in err_msg or "blocked" in err_msg.lower() or "limit" in err_msg.lower():
-                        st.error("Supabase 免费版请求超限，请稍后再试（通常几小时后自动恢复）")
-                    else:
-                        st.error(f"加载失败: {e}")
-        else:
-            st.caption("暂无云端训练结果")
-    else:
-        st.caption("未配置云端数据库（设置 SUPABASE_URL/KEY）")
-
-    st.divider()
-
     # 模型选择
     st.subheader("模型选择")
-    all_models = ["LSTM", "GRU", "1D-CNN", "PatchTST", "TFT", "ARIMA", "EGARCH"]
-    selected_models = st.multiselect("选择模型", all_models, default=all_models)
+    all_models = [
+        "LSTM", "GRU", "1D-CNN", "CNN-GRU", "PatchTST", "TFT",
+        "XGBoost", "LightGBM",
+        "ARIMA", "SARIMA", "EGARCH",
+    ]
+    selected_models = st.multiselect("选择模型", all_models, default=all_models,
+                                      help="DL: LSTM/GRU/1D-CNN/CNN-GRU/PatchTST/TFT | 树模型: XGBoost/LightGBM | 统计: ARIMA/SARIMA/EGARCH")
     use_ensemble = st.toggle("集成预测", value=True)
 
     st.divider()
@@ -313,6 +426,31 @@ with st.sidebar:
             tft_n_heads = st.select_slider("TFT注意力头数", [2, 4, 8],
                                             value=tft_cfg.get("n_heads", 4))
 
+    with st.expander("树模型参数"):
+        if quick_mode:
+            xgb_n_estimators = st.slider("XGBoost 树数", 20, 100, 50)
+            lgb_n_estimators = st.slider("LightGBM 树数", 20, 100, 50)
+        else:
+            xgb_n_estimators = st.slider("XGBoost 树数", 50, 500, 100)
+            lgb_n_estimators = st.slider("LightGBM 树数", 50, 500, 100)
+        xgb_max_depth = st.slider("XGBoost 最大深度", 3, 15, 6)
+        xgb_lr = st.number_input("XGBoost 学习率", 0.01, 0.5, 0.1, format="%.2f")
+        lgb_max_depth = st.slider("LightGBM 最大深度", 3, 15, 6)
+        lgb_num_leaves = st.slider("LightGBM 叶子数", 10, 127, 31)
+
+    with st.expander("SARIMA参数"):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            sarima_p = st.slider("p", 0, 3, 1)
+            sarima_d = st.slider("d", 0, 2, 1)
+            sarima_q = st.slider("q", 0, 3, 1)
+        with c2:
+            sarima_P = st.slider("季节P", 0, 3, 1)
+            sarima_D = st.slider("季节D", 0, 2, 1)
+            sarima_Q = st.slider("季节Q", 0, 3, 1)
+        with c3:
+            sarima_s = st.slider("季节周期s", 3, 30, 5)
+
     st.divider()
 
     # 模型状态
@@ -322,8 +460,22 @@ with st.sidebar:
 
     # 操作按钮
     st.subheader("操作")
-    btn_train = st.button("训练所有模型", type="primary", use_container_width=True,
-                          disabled=st.session_state.stock_data is None)
+    if st.session_state.training_active:
+        st.warning("训练进行中，请勿刷新页面")
+        if st.button("强制停止训练", use_container_width=True, type="secondary"):
+            lock = _training_lock_read()
+            if lock and lock.get("pid"):
+                try:
+                    import signal
+                    os.kill(lock["pid"], signal.SIGKILL)
+                except Exception:
+                    pass
+            _training_lock_clear()
+            st.session_state.training_active = False
+            st.rerun()
+    else:
+        btn_train = st.button("训练所有模型", type="primary", use_container_width=True,
+                              disabled=st.session_state.stock_data is None)
     btn_export = st.button("导出所有结果", use_container_width=True,
                            disabled=st.session_state.train_results is None)
 
@@ -371,6 +523,14 @@ def _build_config():
         tft_n_heads=tft_n_heads,
         tft_dropout=tf_cfg.get("dropout", 0.2),
         tft_lstm_layers=qm.get("tft_lstm_layers", 1) if quick_mode else tf_cfg.get("lstm_layers", 1),
+        xgboost_n_estimators=xgb_n_estimators,
+        xgboost_max_depth=xgb_max_depth,
+        xgboost_learning_rate=xgb_lr,
+        lightgbm_n_estimators=lgb_n_estimators,
+        lightgbm_max_depth=lgb_max_depth,
+        lightgbm_num_leaves=lgb_num_leaves,
+        sarima_order=(sarima_p, sarima_d, sarima_q),
+        sarima_seasonal_order=(sarima_P, sarima_D, sarima_Q, sarima_s),
     )
 
 
@@ -396,6 +556,7 @@ class StreamlitTrainingCallbacks(TrainingCallbacks):
         self.total_models = len(model_list)
         for name in model_list:
             self.loss_history[name] = {"train": [], "val": [], "lr": [], "grad": []}
+        self._add_log(f"训练启动 | 模型: {', '.join(model_list)}")
 
     def on_model_start(self, model_name, model_index, total_models):
         if model_name in self.containers:
@@ -409,7 +570,21 @@ class StreamlitTrainingCallbacks(TrainingCallbacks):
             self.status.markdown(f"已用: {elapsed:.0f}s | 预计剩余: {eta:.0f}s")
         else:
             self.status.markdown(f"已用: {elapsed:.0f}s")
-        self._add_log(f"[{model_name}] 开始训练")
+        self._add_log(f"[{model_name}] 开始训练 ({model_index+1}/{total_models})")
+
+    def on_fold_start(self, model_name, fold, total_folds):
+        self._add_log(f"[{model_name}] 交叉验证 Fold {fold}/{total_folds}")
+
+    def on_fold_end(self, model_name, fold, fold_metrics):
+        rmse = fold_metrics.get("rmse", 0)
+        r2 = fold_metrics.get("r2", 0)
+        self._add_log(f"[{model_name}] Fold {fold} 完成 | RMSE={rmse:.4f}, R²={r2:.4f}")
+
+    def on_early_stop(self, model_name, epoch, best_epoch):
+        self._add_log(f"[{model_name}] 早停 Epoch {epoch} (最佳 Epoch {best_epoch})")
+
+    def on_log(self, message):
+        self._add_log(message)
 
     def on_epoch_end(self, model_name, epoch, total_epochs,
                      train_loss, val_loss, lr, grad_norm=None):
@@ -491,7 +666,12 @@ class StreamlitTrainingCallbacks(TrainingCallbacks):
                 c["status"].error(f"**{model_name}** - 训练失败: {err}")
         pct = self.completed_models / self.total_models
         self.progress.progress(pct, text=f"已完成 {self.completed_models}/{self.total_models}")
-        self._add_log(f"[{model_name}] 完成 (耗时 {result.training_time:.1f}s)")
+        rmse = result.cv_metrics.get("rmse", np.nan)
+        r2 = result.cv_metrics.get("r2", np.nan)
+        metrics_str = ""
+        if not np.isnan(rmse):
+            metrics_str = f" | RMSE={rmse:.4f}, R²={r2:.4f}"
+        self._add_log(f"[{model_name}] ✓ 完成 (耗时 {result.training_time:.1f}s){metrics_str}")
 
     def on_training_complete(self, all_results):
         total_time = _time.time() - self.start_time
@@ -507,6 +687,10 @@ class StreamlitTrainingCallbacks(TrainingCallbacks):
 # ═══════ 训练触发 ═══════
 
 if btn_train and st.session_state.stock_data is not None:
+    _training_lock_write({"pid": os.getpid(),
+                          "stock_code": st.session_state.stock_code,
+                          "started_at": datetime.now().isoformat()})
+
     # 杀死可能残留的训练进程，避免抢占 CPU
     import subprocess, signal
     try:
@@ -526,9 +710,10 @@ if btn_train and st.session_state.stock_data is not None:
     overall_status = st.empty()
 
     st.subheader("实时监控")
-    dl_selected = [m for m in selected_models if m in ("LSTM", "GRU", "1D-CNN", "PatchTST", "TFT")]
-    stat_selected = [m for m in selected_models if m in ("ARIMA", "EGARCH")]
-    all_ordered = dl_selected + stat_selected
+    dl_selected = [m for m in selected_models if m in ("LSTM", "GRU", "1D-CNN", "CNN-GRU", "PatchTST", "TFT")]
+    tree_selected = [m for m in selected_models if m in ("XGBoost", "LightGBM")]
+    stat_selected = [m for m in selected_models if m in ("ARIMA", "SARIMA", "EGARCH")]
+    all_ordered = dl_selected + tree_selected + stat_selected
 
     model_containers = {}
     if all_ordered:
@@ -592,6 +777,7 @@ if btn_train and st.session_state.stock_data is not None:
             )
 
         st.session_state.train_results = results
+        st.session_state["_last_config"] = model_config
 
         # 保存loss_history供Tab2展示
         st.session_state["_loss_history"] = sl_callbacks.loss_history
@@ -612,6 +798,17 @@ if btn_train and st.session_state.stock_data is not None:
             preds = ensemble_predict(results, weights, forecast_days, last_price)
             st.session_state.predictions = preds
 
+        # 应用A股涨跌停限制
+        if preds and last_price:
+            stock_code = st.session_state.get("stock_code", "")
+            stock_name = st.session_state.get("stock_name", "")
+            limit_pct = detect_price_limit_pct(stock_code, stock_name)
+            if limit_pct is not None:
+                preds = apply_price_limits(preds, last_price, limit_pct)
+                st.session_state.predictions = preds
+                st.session_state["_price_limit_pct"] = limit_pct
+                st.session_state["_board_name"] = get_board_name(stock_code)
+
         # 保存模型
         for name, result in results.items():
             if result.model_object is not None:
@@ -623,7 +820,7 @@ if btn_train and st.session_state.stock_data is not None:
         # 保存到云端
         if weights and preds:
             try:
-                sid = supabase_save(
+                sid = cloud_save(
                     st.session_state.stock_code, st.session_state.stock_name,
                     results, weights, preds, model_config, forecast_days, selected_models,
                     stock_data=st.session_state.stock_data)
@@ -639,6 +836,7 @@ if btn_train and st.session_state.stock_data is not None:
         st.code(traceback.format_exc())
 
     st.session_state.training_active = False
+    _training_lock_clear()
     st.rerun()
 
 
@@ -657,9 +855,10 @@ with tab1:
         code = st.session_state.stock_code or ""
 
         # 信息卡片
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2 = st.columns(2)
         c1.metric("股票", f"{name} ({code})")
         c2.metric("数据量", f"{len(df)} 天")
+        c3, c4 = st.columns(2)
         c3.metric("最新收盘", f"¥{df['close'].iloc[-1]:.2f}")
         c4.metric("数据区间", f"{df.index[0].strftime('%Y-%m-%d')} ~ {df.index[-1].strftime('%Y-%m-%d')}")
 
@@ -687,6 +886,81 @@ with tab1:
         stats = df[["open", "high", "low", "close", "volume"]].describe().T
         stats.columns = ["计数", "均值", "标准差", "最小", "25%", "50%", "75%", "最大"]
         st.dataframe(stats.style.format("{:.2f}"), use_container_width=True)
+
+        # 数据质量检查
+        passed, val_warnings, val_errors = validate_training_data(df)
+        if val_warnings:
+            for w in val_warnings:
+                st.warning(f"数据质量: {w}")
+        if val_errors:
+            for e in val_errors:
+                st.error(f"数据质量: {e}")
+
+        # 成交量分析
+        with st.expander("成交量分析", expanded=False):
+            if "close" in df.columns and "volume" in df.columns:
+                df_ind = compute_technical_indicators(df.head(200) if len(df) > 200 else df)
+                recent = df_ind.dropna().tail(100)
+                if len(recent) == 0:
+                    st.info("数据不足，无法进行成交量分析")
+                else:
+
+                    col_v1, col_v2 = st.columns(2)
+                    with col_v1:
+                        fig_vol = go.Figure()
+                        fig_vol.add_trace(go.Scatter(x=recent.index, y=recent["vol_ma5"],
+                            name="5日均量", line=dict(color="red")))
+                        fig_vol.add_trace(go.Scatter(x=recent.index, y=recent["vol_ma20"],
+                            name="20日均量", line=dict(color="blue")))
+                        fig_vol.update_layout(height=300, title="成交量趋势",
+                            xaxis_title="日期", yaxis_title="成交量")
+                        st.plotly_chart(fig_vol, use_container_width=True)
+
+                    with col_v2:
+                        fig_ratio = go.Figure()
+                        fig_ratio.add_trace(go.Scatter(x=recent.index, y=recent["vol_ratio"],
+                            name="量比", line=dict(color="green")))
+                        fig_ratio.add_hline(y=1.0, line_dash="dash", line_color="gray",
+                            annotation_text="基准线")
+                        fig_ratio.add_hline(y=1.5, line_dash="dash", line_color="orange",
+                            annotation_text="放量(+50%)")
+                        fig_ratio.update_layout(height=300, title="量比 (vol/vol_ma20)",
+                            xaxis_title="日期", yaxis_title="量比")
+                        st.plotly_chart(fig_ratio, use_container_width=True)
+
+                    # OBV
+                    fig_obv = go.Figure()
+                    obv_colors = ["red" if recent["close"].iloc[i] >= recent["close"].iloc[max(0, i-1)]
+                                  else "green" for i in range(len(recent))]
+                    fig_obv.add_trace(go.Scatter(x=recent.index, y=recent["obv"],
+                        name="OBV", mode="lines+markers", marker_color=obv_colors))
+                    fig_obv.update_layout(height=300, title="能量潮指标 (OBV)",
+                        xaxis_title="日期", yaxis_title="OBV")
+                    st.plotly_chart(fig_obv, use_container_width=True)
+
+                    # 资金流向信号
+                    latest_vol_ratio = recent["vol_ratio"].iloc[-1]
+                    latest_corr = recent["vol_price_corr"].iloc[-1]
+                    if pd.notna(latest_vol_ratio) and pd.notna(latest_corr):
+                        signals = []
+                        if latest_vol_ratio > 1.5 and recent["close"].iloc[-1] > recent["close"].iloc[-2]:
+                            signals.append("放量上涨，上涨趋势确认")
+                        elif latest_vol_ratio > 1.5 and recent["close"].iloc[-1] < recent["close"].iloc[-2]:
+                            signals.append("放量下跌，注意风险")
+                        elif latest_vol_ratio < 0.5:
+                            signals.append("缩量，市场观望情绪浓")
+                        if latest_corr > 0.5:
+                            signals.append("量价正相关 (量随价涨)")
+                        elif latest_corr < -0.5:
+                            signals.append("量价负相关 (量价背离)")
+
+                        if signals:
+                            st.caption("**资金流向信号:**")
+                            for s in signals:
+                                if "风险" in s:
+                                    st.warning(s)
+                                else:
+                                    st.info(s)
     else:
         st.info("请先在侧边栏获取或上传数据")
 
@@ -880,9 +1154,59 @@ with tab3:
                 fill="toself", fillcolor="rgba(255,0,0,0.1)",
                 line=dict(color="rgba(255,0,0,0)"), name="95%置信区间"))
 
-        fig_price.update_layout(height=450, title="收盘价预测走势（含置信区间）",
+        # 涨跌停限制线
+        limit_pct_display = st.session_state.get("_price_limit_pct")
+        if limit_pct_display is not None:
+            board = st.session_state.get("_board_name", "")
+            upper_limit = last_price * (1 + limit_pct_display)
+            lower_limit = last_price * (1 - limit_pct_display)
+            fig_price.add_hline(y=upper_limit, line_dash="dash", line_color="purple",
+                                annotation_text=f"涨停(+{limit_pct_display*100:.0f}%)",
+                                annotation_position="top right")
+            fig_price.add_hline(y=lower_limit, line_dash="dash", line_color="purple",
+                                annotation_text=f"跌停(-{limit_pct_display*100:.0f}%)",
+                                annotation_position="bottom right")
+
+        # 斐波那契回调水平线
+        if st.session_state.stock_data is not None:
+            fib_data = calculate_fibonacci_levels(st.session_state.stock_data, lookback_days=90)
+            fib_levels = fib_data["levels"]
+            for level in FIB_LEVELS:
+                if level in FIB_COLORS:
+                    fig_price.add_hline(y=fib_levels[level], line_dash="dash",
+                        line_color=FIB_COLORS[level], opacity=0.35,
+                        annotation_text=f"{FIB_NAMES[level]} ({fib_levels[level]:.1f})",
+                        annotation_position="left")
+
+        fig_price.update_layout(height=500, title="收盘价预测走势（含置信区间）",
                                 xaxis_title="日期", yaxis_title="价格(¥)")
         st.plotly_chart(fig_price, use_container_width=True)
+
+        # 涨跌停信息
+        if limit_pct_display is not None:
+            board = st.session_state.get("_board_name", "")
+            upper_limit = last_price * (1 + limit_pct_display)
+            lower_limit = last_price * (1 - limit_pct_display)
+            st.info(f"板块: **{board}** | 涨跌停限制: ±**{limit_pct_display*100:.0f}%** | 涨停价: ¥{upper_limit:.2f} | 跌停价: ¥{lower_limit:.2f}")
+
+        # 斐波那契交易信号
+        if st.session_state.stock_data is not None:
+            fib_signals = generate_fibonacci_signals(last_price, fib_data, preds)
+            if fib_signals:
+                st.subheader("斐波那契交易信号")
+                for s in fib_signals:
+                    if s["signal"] == "buy":
+                        st.success(f"**[买入信号]** {s['description']}")
+                    elif s["signal"] == "sell":
+                        st.warning(f"**[卖出信号]** {s['description']}")
+                buy_count = sum(1 for s in fib_signals if s["signal"] == "buy")
+                sell_count = sum(1 for s in fib_signals if s["signal"] == "sell")
+                if buy_count > sell_count:
+                    st.success(f"斐波那契分析: **偏向看多** ({buy_count} 买入 vs {sell_count} 卖出)")
+                elif sell_count > buy_count:
+                    st.warning(f"斐波那契分析: **偏向看空** ({sell_count} 卖出 vs {buy_count} 买入)")
+                else:
+                    st.info("斐波那契分析: **中性观望**")
 
         # 各模型对比
         if preds.get("model_predictions"):
@@ -1049,6 +1373,35 @@ with tab5:
             fig_perf.update_layout(height=350, title="RMSE 随时间变化",
                                    xaxis_title="训练日期", yaxis_title="RMSE")
             st.plotly_chart(fig_perf, use_container_width=True)
+
+        # 训练参数记录
+        last_config = st.session_state.get("_last_config")
+        loaded_config = st.session_state.get("_loaded_config")
+        if last_config or loaded_config:
+            with st.expander("训练参数记录", expanded=False):
+                cfg = loaded_config if loaded_config else last_config
+                if isinstance(cfg, dict):
+                    st.json(cfg)
+                else:
+                    st.json({
+                        "look_back": cfg.look_back,
+                        "n_features": cfg.n_features,
+                        "epochs": cfg.epochs,
+                        "batch_size": cfg.batch_size,
+                        "learning_rate": cfg.learning_rate,
+                        "dropout": cfg.dropout,
+                        "lstm_units": cfg.lstm_units,
+                        "gru_units": cfg.gru_units,
+                        "cnn_filters": cfg.cnn_filters,
+                        "cnn_gru_filters": cfg.cnn_gru_filters,
+                        "cnn_gru_gru_units": cfg.cnn_gru_gru_units,
+                        "xgboost_n_estimators": cfg.xgboost_n_estimators,
+                        "xgboost_max_depth": cfg.xgboost_max_depth,
+                        "lightgbm_n_estimators": cfg.lightgbm_n_estimators,
+                        "lightgbm_max_depth": cfg.lightgbm_max_depth,
+                        "sarima_order": cfg.sarima_order,
+                        "sarima_seasonal_order": cfg.sarima_seasonal_order,
+                    })
     else:
         st.info("请先加载数据")
 
