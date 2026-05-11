@@ -233,11 +233,13 @@ def list_stock_sessions(stock_code: str) -> list:
 
 
 def fetch_and_store(stock_code: str, start_date: str = "20200101",
-                    end_date: str = None, progress_callback=None) -> tuple:
+                    end_date: str = None, max_days: int = None,
+                    progress_callback=None) -> tuple:
     """
     从 AKShare 获取数据并存入 MySQL
     start_date/end_date: YYYYMMDD 格式
-    返回: (DataFrame, 是否已有数据)
+    max_days: 最多保留最近多少交易日（None=不限制，建议500）
+    返回: (DataFrame, stock_name, 是否已有数据)
     """
     if end_date is None:
         end_date = datetime.now().strftime("%Y%m%d")
@@ -268,6 +270,9 @@ def fetch_and_store(stock_code: str, start_date: str = "20200101",
                 except Exception as e:
                     if progress_callback:
                         progress_callback("update_failed")
+            # 截取最近 max_days 天（增量更新可能导致数据超过限制）
+            if max_days and len(df) > max_days:
+                df = df.tail(max_days)
         if progress_callback:
             progress_callback("done")
         return df, name, True
@@ -279,6 +284,10 @@ def fetch_and_store(stock_code: str, start_date: str = "20200101",
     from src.predict.data_input import load_from_akshare, get_stock_name
     df = load_from_akshare(stock_code, start_date, end_date)
     name = get_stock_name(stock_code)
+
+    # 截取最近 max_days 天
+    if max_days and len(df) > max_days:
+        df = df.tail(max_days)
 
     if progress_callback:
         progress_callback("storing")
