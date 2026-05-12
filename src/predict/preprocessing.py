@@ -21,9 +21,10 @@ def preprocess_data(df: pd.DataFrame, return_clip: float = 0.10) -> pd.DataFrame
     """
     df = df.copy()
 
-    # ── 1. 日收益率（百分比） ──────────────────────
+    # ── 1. 日收益率（小数形式，如 0.015 = 1.5%） ──
     if 'pct_change' in df.columns:
-        df['日收益率'] = df['pct_change']
+        # AKShare/Tencent 返回的 pct_change 是百分比形式（1.5 代表 1.5%），转为小数
+        df['日收益率'] = df['pct_change'] / 100.0
     else:
         df['日收益率'] = df['close'].pct_change()  # 小数形式，如 0.015 = 1.5%
 
