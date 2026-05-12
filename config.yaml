@@ -68,8 +68,9 @@ predict:
     arima_max_p: 5
     arima_max_q: 5
     arima_max_d: 2
-    egarch_p: 1
-    egarch_q: 1
+    garch_p: 1
+    garch_q: 1
+    garch_dist: 't'
 
   ensemble:
     method: inverse_rmse
@@ -109,3 +110,8 @@ predict:
     n_heads: 4
     dropout: 0.2
     lstm_layers: 1
+
+  fibonacci:
+    wave_window: 60
+    min_wave_return: 0.05
+    min_peak_distance: 10

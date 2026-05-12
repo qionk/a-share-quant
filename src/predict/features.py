@@ -67,17 +67,25 @@ def compute_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # 成交量动量 (5日变化率)
     df["vol_momentum"] = volume.pct_change(5) * 100
 
+    # 日收益率5日均线（平滑后的收益率趋势）
+    if '日收益率' in df.columns:
+        df['日收益率_ma5'] = df['日收益率'].rolling(5).mean()
+
     return df
 
 
 # 默认特征列（训练用）
 DEFAULT_FEATURE_COLS = [
+    "目标收益率",  # index 0 = 预测目标
     "close", "open", "high", "low", "volume",
     "ma5", "ma10", "ma20", "ma60",
     "dif", "dea", "macd", "rsi",
     "boll_upper", "boll_mid", "boll_lower",
     "pct_change", "vol_ma5", "vol_ma20",
     "obv", "vol_ratio", "vwap", "vol_price_corr", "vol_momentum",
+    "日收益率", "日收益率_ma5",
+    "成交量变化率", "相对成交量", "量价配合度",
+    "放量上涨", "缩量下跌",
 ]
 
 

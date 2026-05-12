@@ -321,7 +321,7 @@ def train_one_stock(code, name, config, forecast_days=5):
     all_models = [
         "LSTM", "GRU", "1D-CNN", "CNN-GRU", "PatchTST", "TFT",
         "XGBoost", "LightGBM",
-        "ARIMA", "SARIMA", "EGARCH",
+        "ARIMA", "SARIMA", "GARCH",
     ]
 
     callbacks = ConsoleCallbacks()

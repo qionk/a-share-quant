@@ -1,6 +1,7 @@
 """
 价格预测 - 训练与评估
 时序交叉验证 + 模型训练 + 指标计算 + 集成预测
+所有模型统一预测日收益率（目标列 index 0），再反算预测股价
 """
 
 import time
@@ -18,10 +19,11 @@ from .features import (
 from .models import (
     ModelConfig, build_lstm, build_gru, build_cnn, build_cnn_gru,
     build_patchtst, build_tft,
-    fit_arima, predict_arima, fit_egarch, predict_egarch,
+    fit_arima, predict_arima,
     fit_sarima, predict_sarima,
     build_xgboost, build_lightgbm, returns_to_prices,
 )
+from .preprocessing import preprocess_data, returns_to_price_series
 
 
 class TrainingCallbacks:
@@ -91,6 +93,8 @@ class TrainResult:
     cv_metrics: dict = field(default_factory=dict)
     test_predictions: np.ndarray = field(default_factory=lambda: np.array([]))
     test_actuals: np.ndarray = field(default_factory=lambda: np.array([]))
+    test_returns: np.ndarray = field(default_factory=lambda: np.array([]))
+    test_returns_actual: np.ndarray = field(default_factory=lambda: np.array([]))
     confidence_lower: np.ndarray = field(default_factory=lambda: np.array([]))
     confidence_upper: np.ndarray = field(default_factory=lambda: np.array([]))
     future_predictions: np.ndarray = field(default_factory=lambda: np.array([]))
@@ -100,6 +104,7 @@ class TrainResult:
     scaler: object = None
     feature_cols: list = field(default_factory=list)
     n_features: int = 0
+    _last_close: float = 0.0  # 用于反算价格的基准价
 
 
 def calc_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
@@ -368,14 +373,19 @@ def train_arima_model(close_prices: np.ndarray, config: ModelConfig,
     return result
 
 
-def train_egarch_model(returns: np.ndarray, close_prices: np.ndarray,
+def train_garch_model(returns: np.ndarray, close_prices: np.ndarray,
                        config: ModelConfig, progress_callback=None) -> TrainResult:
-    """训练 EGARCH 模型"""
+    """训练 GARCH(1,1) 波动率模型"""
+    import warnings
+    warnings.filterwarnings("ignore")
+
     start = time.time()
-    result = TrainResult(model_name="EGARCH")
+    result = TrainResult(model_name="GARCH")
+
+    from .volatility import fit_garch, predict_garch_volatility, compute_risk_metrics, historical_volatility_fallback
 
     if progress_callback:
-        progress_callback(0.1, "EGARCH: 拟合中...")
+        progress_callback(0.1, "GARCH: 拟合中...")
 
     split_pt = int(len(returns) * 0.85)
     train_ret = returns[:split_pt]
@@ -383,36 +393,52 @@ def train_egarch_model(returns: np.ndarray, close_prices: np.ndarray,
     test_close = close_prices[split_pt:]
 
     try:
-        model_result = fit_egarch(train_ret)
-        result.model_object = model_result
+        garch_res = fit_garch(train_ret, config.garch_p, config.garch_q, config.garch_dist)
 
-        # 滚动预测
-        preds_ret = []
-        for i in range(len(test_ret)):
-            from arch import arch_model
-            am = arch_model(returns[:split_pt + i], vol="EGARCH", p=1, q=1,
-                            mean="AR", lags=1, dist="normal")
-            res = am.fit(disp="off", show_warning=False)
-            fc_mean, _ = predict_egarch(res, steps=1)
-            preds_ret.append(fc_mean[0])
+        if garch_res is None:
+            raise RuntimeError("GARCH 未收敛")
 
-        preds_ret = np.array(preds_ret)
-        pred_prices = returns_to_prices(close_prices[split_pt - 1], preds_ret)
+        result.model_object = garch_res
 
+        # 预测波动率
+        vol_info = predict_garch_volatility(garch_res, horizon=len(test_ret))
+        pred_returns = vol_info['mean_forecast'][:len(test_ret)]
+
+        # 存储收益率预测
+        result.test_returns = pred_returns
+        result.test_returns_actual = test_ret
+
+        # 转为价格用于指标计算
+        pred_prices = returns_to_prices(close_prices[split_pt - 1], pred_returns)
         result.test_predictions = pred_prices[:len(test_close)]
         result.test_actuals = test_close
         result.cv_metrics = calc_metrics(test_close, pred_prices[:len(test_close)])
 
-        avg_err = np.mean(np.abs(pred_prices[:len(test_close)] - test_close))
-        result.confidence_lower = pred_prices[:len(test_close)] - 1.96 * avg_err
-        result.confidence_upper = pred_prices[:len(test_close)] + 1.96 * avg_err
+        # 风险指标
+        result.train_history['risk_metrics'] = compute_risk_metrics(train_ret, garch_res)
+
+        # 置信区间
+        conf_lower_ret = vol_info['confidence_lower'][:len(test_ret)]
+        conf_upper_ret = vol_info['confidence_upper'][:len(test_ret)]
+        result.confidence_lower = returns_to_prices(close_prices[split_pt - 1], conf_lower_ret)[:len(test_close)]
+        result.confidence_upper = returns_to_prices(close_prices[split_pt - 1], conf_upper_ret)[:len(test_close)]
 
     except Exception as e:
-        result.cv_metrics = {"mae": np.nan, "rmse": np.nan, "mape": np.nan, "r2": np.nan}
-        result.train_history = {"error": str(e)}
+        # GARCH 拟合失败，使用历史波动率替代
+        if callable(progress_callback):
+            progress_callback(0.5, "GARCH: 拟合失败，使用历史波动率")
+        vol_info = historical_volatility_fallback(returns, horizon=len(test_ret))
+        pred_returns = vol_info['mean_forecast'][:len(test_ret)]
+        result.test_returns = pred_returns
+        result.test_returns_actual = test_ret
+        result.train_history = {"error": str(e), "fallback": "历史波动率"}
+        pred_prices = returns_to_prices(close_prices[split_pt - 1], pred_returns)
+        result.test_predictions = pred_prices[:len(test_close)]
+        result.test_actuals = test_close
+        result.cv_metrics = calc_metrics(test_close, pred_prices[:len(test_close)])
 
     if progress_callback:
-        progress_callback(1.0, "EGARCH: 完成")
+        progress_callback(1.0, "GARCH: 完成")
 
     result.training_time = time.time() - start
     return result
@@ -672,7 +698,11 @@ def train_all_models(df: pd.DataFrame, selected_models: list, config: ModelConfi
     if progress_callback and not callbacks:
         callbacks = LegacyCallbackAdapter(progress_callback, len(selected_models))
 
-    df_ind = compute_technical_indicators(df)
+    # ── 新增：收益率为目标的预处理 ─────────────────────
+    df_ret = preprocess_data(df)
+    last_close = float(df['close'].iloc[-1])
+
+    df_ind = compute_technical_indicators(df_ret)
     scaled, scaler, feature_cols, cleaned_df = prepare_features(df_ind)
 
     # 训练前数据质量检查
@@ -713,7 +743,7 @@ def train_all_models(df: pd.DataFrame, selected_models: list, config: ModelConfi
     results = {}
     dl_models = [m for m in selected_models if m in ("LSTM", "GRU", "1D-CNN", "CNN-GRU", "PatchTST", "TFT")]
     tree_models = [m for m in selected_models if m in ("XGBoost", "LightGBM")]
-    stat_models = [m for m in selected_models if m in ("ARIMA", "EGARCH", "SARIMA")]
+    stat_models = [m for m in selected_models if m in ("ARIMA", "GARCH", "SARIMA")]
     all_ordered = dl_models + tree_models + stat_models
 
     total = len(selected_models)
@@ -735,25 +765,44 @@ def train_all_models(df: pd.DataFrame, selected_models: list, config: ModelConfi
             result.scaler = scaler
             result.feature_cols = feature_cols
             result.n_features = n_features
+            result._last_close = last_close
 
-            # 反归一化测试集结果
-            result.test_predictions = inverse_transform_predictions(
+            # 反归一化 → 收益率%（目标列 index 0 现在是 目标收益率）
+            pred_returns = inverse_transform_predictions(
                 result.test_predictions, scaler, n_features, 0)
-            result.test_actuals = inverse_transform_predictions(
+            actual_returns = inverse_transform_predictions(
                 result.test_actuals, scaler, n_features, 0)
+            result.test_returns = pred_returns
+            result.test_returns_actual = actual_returns
+
+            # 收益率 → 价格（用于展示和指标）
+            close_arr_full = cleaned_df["close"].values
+            split_pt_price = int(len(close_arr_full) * 0.85)
+            result.test_predictions = returns_to_price_series(
+                close_arr_full[split_pt_price - 1], pred_returns)
+            result.test_actuals = close_arr_full[split_pt_price:]
             result.confidence_lower = inverse_transform_predictions(
                 result.confidence_lower, scaler, n_features, 0)
             result.confidence_upper = inverse_transform_predictions(
                 result.confidence_upper, scaler, n_features, 0)
+            # 置信区间也转价格
+            conf_lower_p = returns_to_price_series(
+                close_arr_full[split_pt_price - 1], result.confidence_lower)
+            conf_upper_p = returns_to_price_series(
+                close_arr_full[split_pt_price - 1], result.confidence_upper)
+            result.confidence_lower = conf_lower_p
+            result.confidence_upper = conf_upper_p
 
-            # 重新算反归一化后的指标
-            result.cv_metrics = calc_metrics(result.test_actuals, result.test_predictions)
+            # 重新算反归一化后的指标（基于价格）
+            n_min = min(len(result.test_actuals), len(result.test_predictions))
+            result.cv_metrics = calc_metrics(
+                result.test_actuals[:n_min], result.test_predictions[:n_min])
 
-            # 未来预测
+            # 未来预测 → 收益率%
             last_seq = X[-1:].copy()
             future_preds = _predict_future_dl(result.model_object, last_seq, forecast_days,
                                                scaler, n_features, 0)
-            result.future_predictions = future_preds
+            result.future_predictions = future_preds  # 现在是收益率%
 
         except Exception as e:
             result = TrainResult(model_name=name)
@@ -782,24 +831,41 @@ def train_all_models(df: pd.DataFrame, selected_models: list, config: ModelConfi
             result.scaler = scaler
             result.feature_cols = tab_feature_names
             result.n_features = n_features
+            result._last_close = last_close
 
-            # 反归一化
-            result.test_predictions = inverse_transform_predictions(
+            # 反归一化 → 收益率%
+            pred_returns = inverse_transform_predictions(
                 result.test_predictions, scaler, n_features, 0)
-            result.test_actuals = inverse_transform_predictions(
+            actual_returns = inverse_transform_predictions(
                 result.test_actuals, scaler, n_features, 0)
-            result.confidence_lower = inverse_transform_predictions(
-                result.confidence_lower, scaler, n_features, 0)
-            result.confidence_upper = inverse_transform_predictions(
-                result.confidence_upper, scaler, n_features, 0)
-            result.cv_metrics = calc_metrics(result.test_actuals, result.test_predictions)
+            result.test_returns = pred_returns
+            result.test_returns_actual = actual_returns
 
-            # 未来预测
+            # 收益率 → 价格
+            close_arr_full = cleaned_df["close"].values
+            split_pt_price = int(len(close_arr_full) * 0.85)
+            result.test_predictions = returns_to_price_series(
+                close_arr_full[split_pt_price - 1], pred_returns)
+            result.test_actuals = close_arr_full[split_pt_price:]
+            conf_lower_ret = inverse_transform_predictions(
+                result.confidence_lower, scaler, n_features, 0)
+            conf_upper_ret = inverse_transform_predictions(
+                result.confidence_upper, scaler, n_features, 0)
+            result.confidence_lower = returns_to_price_series(
+                close_arr_full[split_pt_price - 1], conf_lower_ret)
+            result.confidence_upper = returns_to_price_series(
+                close_arr_full[split_pt_price - 1], conf_upper_ret)
+
+            n_min = min(len(result.test_actuals), len(result.test_predictions))
+            result.cv_metrics = calc_metrics(
+                result.test_actuals[:n_min], result.test_predictions[:n_min])
+
+            # 未来预测 → 收益率%
             last_tab_features = X_tab_train[-1].copy()
             future_preds = _predict_future_tree(
                 result.model_object, last_tab_features, forecast_days,
                 scaler, n_features, tab_feature_names)
-            result.future_predictions = future_preds
+            result.future_predictions = future_preds  # 现在是收益率%
 
         except Exception as e:
             result = TrainResult(model_name=name)
@@ -822,13 +888,18 @@ def train_all_models(df: pd.DataFrame, selected_models: list, config: ModelConfi
         result.scaler = scaler
         result.feature_cols = feature_cols
         result.n_features = n_features
+        result._last_close = last_close
 
         try:
             if result.model_object is not None:
                 fc, conf = predict_arima(result.model_object, steps=forecast_days)
-                result.future_predictions = fc
-                result.future_conf_lower = conf[:, 0]
-                result.future_conf_upper = conf[:, 1]
+                # ARIMA 预测价格 → 转为收益率供集成使用
+                arima_returns = (fc / close_arr[-1] - 1) * 100
+                result.future_predictions = arima_returns
+                conf_low_ret = (conf[:, 0] / close_arr[-1] - 1) * 100
+                conf_up_ret = (conf[:, 1] / close_arr[-1] - 1) * 100
+                result.future_conf_lower = conf_low_ret
+                result.future_conf_upper = conf_up_ret
         except Exception:
             result.future_predictions = np.array([])
 
@@ -837,28 +908,32 @@ def train_all_models(df: pd.DataFrame, selected_models: list, config: ModelConfi
         results["ARIMA"] = result
         done += 1
 
-    if "EGARCH" in stat_models:
+    if "GARCH" in stat_models:
         if callbacks:
-            callbacks.on_model_start("EGARCH", done, total)
-            callbacks.on_log(f"[EGARCH] 波动率建模 | 收益率序列: {len(pd.Series(close_arr).pct_change().dropna())} 天")
-        returns = pd.Series(close_arr).pct_change().dropna().values * 100
-        result = train_egarch_model(returns, close_arr, config, progress_callback=None)
+            callbacks.on_model_start("GARCH", done, total)
+            callbacks.on_log(f"[GARCH] 波动率建模 | 收益率序列: {len(df_ret['日收益率'].dropna())} 天")
+        garch_returns = df_ret['日收益率'].dropna().values
+        result = train_garch_model(garch_returns, close_arr, config, progress_callback=None)
         result.scaler = scaler
         result.feature_cols = feature_cols
         result.n_features = n_features
+        result._last_close = last_close
 
         try:
+            from .volatility import predict_garch_volatility, historical_volatility_fallback
             if result.model_object is not None:
-                mean_fc, vol_fc = predict_egarch(result.model_object, steps=forecast_days)
-                result.future_predictions = returns_to_prices(close_arr[-1], mean_fc)
-                result.future_conf_lower = returns_to_prices(close_arr[-1], mean_fc - 1.96 * vol_fc)
-                result.future_conf_upper = returns_to_prices(close_arr[-1], mean_fc + 1.96 * vol_fc)
+                vol_info = predict_garch_volatility(result.model_object, steps=forecast_days)
+            else:
+                vol_info = historical_volatility_fallback(garch_returns, horizon=forecast_days)
+            result.future_predictions = vol_info['mean_forecast']
+            result.future_conf_lower = vol_info['confidence_lower']
+            result.future_conf_upper = vol_info['confidence_upper']
         except Exception:
             result.future_predictions = np.array([])
 
         if callbacks:
-            callbacks.on_model_end("EGARCH", result)
-        results["EGARCH"] = result
+            callbacks.on_model_end("GARCH", result)
+        results["GARCH"] = result
         done += 1
 
     if "SARIMA" in stat_models:
@@ -869,13 +944,18 @@ def train_all_models(df: pd.DataFrame, selected_models: list, config: ModelConfi
         result.scaler = scaler
         result.feature_cols = feature_cols
         result.n_features = n_features
+        result._last_close = last_close
 
         try:
             if result.model_object is not None:
                 fc, conf = predict_sarima(result.model_object, steps=forecast_days)
-                result.future_predictions = fc
-                result.future_conf_lower = conf[:, 0]
-                result.future_conf_upper = conf[:, 1]
+                # SARIMA 预测价格 → 转为收益率供集成使用
+                sarima_returns = (fc / close_arr[-1] - 1) * 100
+                result.future_predictions = sarima_returns
+                conf_low_ret = (conf[:, 0] / close_arr[-1] - 1) * 100
+                conf_up_ret = (conf[:, 1] / close_arr[-1] - 1) * 100
+                result.future_conf_lower = conf_low_ret
+                result.future_conf_upper = conf_up_ret
         except Exception:
             result.future_predictions = np.array([])
 
@@ -925,8 +1005,9 @@ def compute_ensemble_weights(results: dict) -> dict:
 def ensemble_predict(results: dict, weights: dict, forecast_days: int,
                      last_price: float) -> dict:
     """
-    集成预测未来 N 天
-    返回包含各项预测结果的字典
+    集成预测未来 N 天。
+    输入：各模型的 future_predictions 为收益率%数组
+    输出：包含价格预测和收益率各项的字典
     """
     model_preds = {}
     for name, result in results.items():
@@ -942,7 +1023,7 @@ def ensemble_predict(results: dict, weights: dict, forecast_days: int,
                 "model_predictions": {},
                 "weights": weights}
 
-    # 加权平均
+    # 加权平均收益率%
     weighted_sum = np.zeros(forecast_days)
     total_weight = 0
     for name, preds in model_preds.items():
@@ -952,22 +1033,32 @@ def ensemble_predict(results: dict, weights: dict, forecast_days: int,
             total_weight += w
 
     if total_weight > 0:
-        ensemble_prices = weighted_sum / total_weight
+        ensemble_returns = weighted_sum / total_weight
     else:
-        ensemble_prices = np.mean(list(model_preds.values()), axis=0)
+        ensemble_returns = np.mean(list(model_preds.values()), axis=0)
 
-    # 收益率
+    # 收益率% → 价格
+    ensemble_prices = returns_to_price_series(last_price, ensemble_returns)
+
+    # 日收益率和累计收益（从价格计算）
     price_series = np.concatenate([[last_price], ensemble_prices])
     daily_ret = np.diff(price_series) / price_series[:-1] * 100
     cum_ret = (ensemble_prices / last_price - 1) * 100
 
-    # 置信区间（集成所有模型的区间）
+    # 置信区间：收集各模型的 future_conf，转价格
     all_lowers, all_uppers = [], []
     for name, result in results.items():
-        if len(result.future_conf_lower) >= forecast_days:
-            all_lowers.append(result.future_conf_lower[:forecast_days])
-        if len(result.future_conf_upper) >= forecast_days:
-            all_uppers.append(result.future_conf_upper[:forecast_days])
+        if len(result.future_conf_lower) >= forecast_days and len(result.future_conf_upper) >= forecast_days:
+            # 置信区间也可能是收益率%，需要转为价格
+            conf_l = result.future_conf_lower[:forecast_days]
+            conf_u = result.future_conf_upper[:forecast_days]
+            # 判断是否为收益率（值在 ±20 以内）还是价格
+            if np.max(np.abs(conf_l)) < 50 and np.max(np.abs(conf_u)) < 50:
+                # 收益率%，转价格
+                conf_l = returns_to_price_series(last_price, conf_l)
+                conf_u = returns_to_price_series(last_price, conf_u)
+            all_lowers.append(conf_l)
+            all_uppers.append(conf_u)
 
     conf_lower = np.min(all_lowers, axis=0) if all_lowers else ensemble_prices * 0.95
     conf_upper = np.max(all_uppers, axis=0) if all_uppers else ensemble_prices * 1.05
@@ -978,7 +1069,7 @@ def ensemble_predict(results: dict, weights: dict, forecast_days: int,
         "cumulative_return": cum_ret,
         "confidence_lower": conf_lower,
         "confidence_upper": conf_upper,
-        "model_predictions": model_preds,
+        "model_predictions": model_preds,  # 各模型的收益率%预测
         "weights": weights,
     }
 

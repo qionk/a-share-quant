@@ -1,6 +1,7 @@
 """
 价格预测 - 模型定义
-LSTM / GRU / 1D-CNN / ARIMA / EGARCH
+LSTM / GRU / 1D-CNN / CNN-GRU / PatchTST / TFT /
+XGBoost / LightGBM / ARIMA / SARIMA / GARCH
 """
 
 import os
@@ -54,6 +55,10 @@ class ModelConfig:
     # SARIMA
     sarima_order: tuple = (1, 1, 1)
     sarima_seasonal_order: tuple = (1, 1, 1, 5)
+    # GARCH
+    garch_p: int = 1
+    garch_q: int = 1
+    garch_dist: str = 't'
 
 
 def _set_seed(seed=42):
@@ -361,34 +366,6 @@ def predict_arima(model, steps: int, exog_future: np.ndarray = None):
     fc = np.array(forecast.predicted_mean)
     conf = np.array(forecast.conf_int(alpha=0.05))
     return fc, conf
-
-
-def fit_egarch(returns: np.ndarray, config: ModelConfig = None):
-    """
-    拟合 EGARCH(1,1)
-    returns: 收益率序列（百分比）
-    使用 AR(1) 均值模型捕捉收益率自相关
-    """
-    from arch import arch_model
-    import warnings
-    warnings.filterwarnings("ignore")
-
-    p, q = 1, 1
-    am = arch_model(returns, vol="EGARCH", p=p, q=q, mean="AR", lags=1, dist="normal")
-    result = am.fit(disp="off", show_warning=False)
-    return result
-
-
-def predict_egarch(model_result, steps: int):
-    """
-    EGARCH 预测
-    返回: (mean_forecast, volatility_forecast)
-    """
-    forecast = model_result.forecast(horizon=steps)
-    mean_fc = forecast.mean.iloc[-1].values
-    var_fc = forecast.variance.iloc[-1].values
-    vol_fc = np.sqrt(var_fc)
-    return mean_fc, vol_fc
 
 
 def returns_to_prices(last_price: float, predicted_returns: np.ndarray) -> np.ndarray:

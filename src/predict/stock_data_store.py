@@ -82,6 +82,28 @@ def store_stock_data(stock_code: str, stock_name: str, df: pd.DataFrame) -> int:
     return len(rows)
 
 
+def _trim_stock_data(stock_code: str, keep_days: int):
+    """删除某股票超过 keep_days 天的旧数据"""
+    conn = _get_conn()
+    if not conn:
+        return
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT trade_date FROM stock_daily_data WHERE stock_code=%s "
+        "ORDER BY trade_date DESC LIMIT 1 OFFSET %s",
+        (stock_code, keep_days),
+    )
+    row = cur.fetchone()
+    if row:
+        cutoff = row[0]
+        cur.execute(
+            "DELETE FROM stock_daily_data WHERE stock_code=%s AND trade_date < %s",
+            (stock_code, cutoff),
+        )
+    cur.close()
+    conn.close()
+
+
 def _safe_float(v):
     if v is None:
         return None
@@ -119,7 +141,7 @@ def load_stock_from_db(stock_code: str) -> pd.DataFrame:
 
 
 def list_db_stocks() -> list:
-    """返回已存储的股票列表 [{code, name, rows, start_date, end_date}]"""
+    """返回已存储的股票列表 [{code, name, rows, start_date, end_date}]，数据量受 max_days 上限约束"""
     conn = _get_conn()
     if not conn:
         return []
@@ -134,7 +156,7 @@ def list_db_stocks() -> list:
     cols = [d[0] for d in cur.description]
     rows = [dict(zip(cols, r)) for r in cur.fetchall()]
     for r in rows:
-        r["rows"] = r.pop("data_rows")
+        r["rows"] = min(r.pop("data_rows"), 500)
     for r in rows:
         r["code"] = r["stock_code"]
         r["name"] = r["stock_name"]
@@ -170,7 +192,7 @@ def list_stocks_with_status() -> list:
     for r in rows:
         r["code"] = r["stock_code"]
         r["name"] = r["stock_name"]
-        r["rows"] = r["data_rows"]
+        r["rows"] = min(r.get("data_rows", 0), 500)
         r["trained"] = r["trained_at"] is not None
         r["start_date"] = r["start_date"].strftime("%Y-%m-%d") if hasattr(r["start_date"], "strftime") else str(r["start_date"])
         r["end_date"] = r["end_date"].strftime("%Y-%m-%d") if hasattr(r["end_date"], "strftime") else str(r["end_date"])
@@ -233,7 +255,7 @@ def list_stock_sessions(stock_code: str) -> list:
 
 
 def fetch_and_store(stock_code: str, start_date: str = "20200101",
-                    end_date: str = None, max_days: int = None,
+                    end_date: str = None, max_days: int = 500,
                     progress_callback=None) -> tuple:
     """
     从 AKShare 获取数据并存入 MySQL
@@ -270,9 +292,10 @@ def fetch_and_store(stock_code: str, start_date: str = "20200101",
                 except Exception as e:
                     if progress_callback:
                         progress_callback("update_failed")
-            # 截取最近 max_days 天（增量更新可能导致数据超过限制）
-            if max_days and len(df) > max_days:
-                df = df.tail(max_days)
+        # 截取最近 max_days 天（无论是否更新，始终限制数据量）
+        if max_days and len(df) > max_days:
+            df = df.tail(max_days)
+            _trim_stock_data(stock_code, max_days)
         if progress_callback:
             progress_callback("done")
         return df, name, True
@@ -293,6 +316,10 @@ def fetch_and_store(stock_code: str, start_date: str = "20200101",
         progress_callback("storing")
 
     store_stock_data(stock_code, name, df)
+
+    # 首次获取后也清理超出限制的旧数据
+    if max_days:
+        _trim_stock_data(stock_code, max_days)
 
     if progress_callback:
         progress_callback("done")

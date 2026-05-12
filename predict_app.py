@@ -1,7 +1,7 @@
 """
 A股价格预测工具
 ==============
-功能: 11种模型(LSTM/GRU/1D-CNN/CNN-GRU/PatchTST/TFT/XGBoost/LightGBM/ARIMA/SARIMA/EGARCH)预测A股个股未来收盘价
+功能: 11种模型(LSTM/GRU/1D-CNN/CNN-GRU/PatchTST/TFT/XGBoost/LightGBM/ARIMA/SARIMA/GARCH)预测A股个股未来收盘价
 启动: streamlit run predict_app.py
 依赖: pip install -r requirements.txt
 """
@@ -49,9 +49,12 @@ from src.predict.stock_data_store import (
 from src.predict.price_limits import (
     detect_price_limit_pct, get_board_name, apply_price_limits,
 )
-from src.predict.fibonacci import (
-    calculate_fibonacci_levels, generate_fibonacci_signals,
-    FIB_LEVELS, FIB_NAMES, FIB_COLORS,
+from src.predict.fibonacci_wave import (
+    detect_wave_levels, calculate_wave_fibonacci, generate_wave_fib_signals,
+)
+from src.predict.long_term_prediction import (
+    resample_to_weekly, train_long_term_models,
+    assess_risk, get_rating,
 )
 from src.data import load_config
 
@@ -59,7 +62,7 @@ from src.data import load_config
 
 st.set_page_config(page_title="A股价格预测", page_icon="📈", layout="wide")
 st.title("A股价格预测工具")
-st.caption("支持 LSTM / GRU / 1D-CNN / CNN-GRU / PatchTST / TFT / XGBoost / LightGBM / ARIMA / SARIMA / EGARCH 多模型集成预测")
+st.caption("支持 LSTM / GRU / 1D-CNN / CNN-GRU / PatchTST / TFT / XGBoost / LightGBM / ARIMA / SARIMA / GARCH 多模型集成预测")
 
 config = load_config()
 predict_cfg = config.get("predict", {})
@@ -95,6 +98,9 @@ def _serialize_results() -> bytes:
                 "training_time": r.training_time,
                 "test_predictions": r.test_predictions.tolist() if hasattr(r.test_predictions, 'tolist') else [],
                 "test_actuals": r.test_actuals.tolist() if hasattr(r.test_actuals, 'tolist') else [],
+                "test_returns": r.test_returns.tolist() if hasattr(r.test_returns, 'tolist') else [],
+                "test_returns_actual": r.test_returns_actual.tolist() if hasattr(r.test_returns_actual, 'tolist') else [],
+                "_last_close": r._last_close,
                 "confidence_lower": r.confidence_lower.tolist() if hasattr(r.confidence_lower, 'tolist') else [],
                 "confidence_upper": r.confidence_upper.tolist() if hasattr(r.confidence_upper, 'tolist') else [],
                 "future_predictions": r.future_predictions.tolist() if hasattr(r.future_predictions, 'tolist') else [],
@@ -137,6 +143,9 @@ def _deserialize_results(content: bytes):
             tr.training_time = rd.get("training_time", 0)
             tr.test_predictions = np.array(rd.get("test_predictions", []))
             tr.test_actuals = np.array(rd.get("test_actuals", []))
+            tr.test_returns = np.array(rd.get("test_returns", []))
+            tr.test_returns_actual = np.array(rd.get("test_returns_actual", []))
+            tr._last_close = rd.get("_last_close", 0.0)
             tr.confidence_lower = np.array(rd.get("confidence_lower", []))
             tr.confidence_upper = np.array(rd.get("confidence_upper", []))
             tr.future_predictions = np.array(rd.get("future_predictions", []))
@@ -175,6 +184,51 @@ if "cloud_stocks_cache" not in st.session_state:
     st.session_state.cloud_stocks_ts = 0
 if "db_stocks" not in st.session_state:
     st.session_state.db_stocks = []
+
+# ── 模型参数默认值（供 st.dialog 弹窗使用） ──
+DEFAULT_MODEL_PARAMS = {
+    "XGBoost": {"n_estimators": 100, "max_depth": 6, "learning_rate": 0.1, "subsample": 0.8},
+    "LightGBM": {"n_estimators": 100, "max_depth": 6, "learning_rate": 0.1, "num_leaves": 31, "subsample": 0.8},
+    "1D-CNN": {"look_back": 30, "filters": 32, "kernel_size": 3, "dropout": 0.2, "learning_rate": 0.001},
+    "CNN-GRU": {"cnn_filters": 64, "kernel_size": 3, "gru_units": 32, "dropout": 0.2, "learning_rate": 0.001},
+    "GRU": {"units": 32, "look_back": 30, "dropout": 0.2, "learning_rate": 0.001},
+    "LSTM": {"units": 32, "look_back": 30, "dropout": 0.2, "learning_rate": 0.001},
+    "PatchTST": {"d_model": 128, "n_heads": 4, "n_layers": 2, "patch_size": 16, "dropout": 0.1},
+    "TFT": {"hidden_size": 64, "n_heads": 4, "dropout": 0.2, "lstm_layers": 1},
+    "ARIMA": {"auto": True, "p": 1, "d": 1, "q": 1},
+    "SARIMA": {"p": 1, "d": 1, "q": 1, "P": 1, "D": 1, "Q": 1, "s": 5},
+    "GARCH": {"p": 1, "q": 1, "dist": "t"},
+}
+DL_LEARNING_RATE = 0.001
+DL_EPOCHS = 100
+DL_BATCH_SIZE = 32
+
+if "model_params" not in st.session_state:
+    st.session_state.model_params = {k: dict(v) for k, v in DEFAULT_MODEL_PARAMS.items()}
+if "modified_models" not in st.session_state:
+    st.session_state.modified_models = set()
+if "dl_epochs" not in st.session_state:
+    st.session_state.dl_epochs = DL_EPOCHS
+if "dl_batch_size" not in st.session_state:
+    st.session_state.dl_batch_size = DL_BATCH_SIZE
+if "dl_learning_rate" not in st.session_state:
+    st.session_state.dl_learning_rate = DL_LEARNING_RATE
+if "longterm_results" not in st.session_state:
+    st.session_state.longterm_results = None
+
+
+def _param_changed(model_name, key, value, default_val):
+    """检查参数是否被修改，更新 modified_models"""
+    if value != default_val:
+        st.session_state.modified_models.add(model_name)
+    else:
+        # 检查所有参数是否都恢复默认
+        all_default = all(
+            st.session_state.model_params[model_name].get(k) == DEFAULT_MODEL_PARAMS[model_name].get(k)
+            for k in DEFAULT_MODEL_PARAMS[model_name]
+        )
+        if all_default:
+            st.session_state.modified_models.discard(model_name)
 
 
 def _training_lock_read():
@@ -219,6 +273,251 @@ elif orphan_status == "orphaned":
     st.session_state.training_active = False
     st.warning("检测到上次训练中断（可能刷新了页面），已自动重置训练状态")
 
+
+# ═══════ 模型参数弹窗 (st.dialog) ═══════
+
+@st.dialog("XGBoost 参数设置")
+def xgboost_dialog():
+    params = st.session_state.model_params["XGBoost"]
+    defaults = DEFAULT_MODEL_PARAMS["XGBoost"]
+    new_lr = st.slider("学习率", 0.01, 0.30, params["learning_rate"], 0.01, key="dg_xgb_lr")
+    new_n = st.slider("树数量", 50, 300, params["n_estimators"], 10, key="dg_xgb_n")
+    new_md = st.slider("最大深度", 3, 10, params["max_depth"], 1, key="dg_xgb_md")
+    new_ss = st.slider("子样本", 0.5, 1.0, params["subsample"], 0.05, key="dg_xgb_ss")
+    c1, c2 = st.columns(2)
+    if c1.button("恢复默认", use_container_width=True):
+        st.session_state.model_params["XGBoost"] = dict(defaults)
+        st.session_state.modified_models.discard("XGBoost")
+        st.rerun()
+    if c2.button("确认保存", use_container_width=True, type="primary"):
+        st.session_state.model_params["XGBoost"] = {
+            "n_estimators": new_n, "max_depth": new_md,
+            "learning_rate": new_lr, "subsample": new_ss}
+        _param_changed("XGBoost", "n_estimators", new_n, defaults["n_estimators"])
+        st.rerun()
+
+
+@st.dialog("LightGBM 参数设置")
+def lightgbm_dialog():
+    params = st.session_state.model_params["LightGBM"]
+    defaults = DEFAULT_MODEL_PARAMS["LightGBM"]
+    new_lr = st.slider("学习率", 0.01, 0.30, params["learning_rate"], 0.01, key="dg_lgb_lr")
+    new_n = st.slider("树数量", 50, 300, params["n_estimators"], 10, key="dg_lgb_n")
+    new_md = st.slider("最大深度", 3, 10, params["max_depth"], 1, key="dg_lgb_md")
+    new_nl = st.slider("叶子数", 15, 127, params["num_leaves"], 2, key="dg_lgb_nl")
+    new_ss = st.slider("子样本", 0.5, 1.0, params["subsample"], 0.05, key="dg_lgb_ss")
+    c1, c2 = st.columns(2)
+    if c1.button("恢复默认", use_container_width=True):
+        st.session_state.model_params["LightGBM"] = dict(defaults)
+        st.session_state.modified_models.discard("LightGBM")
+        st.rerun()
+    if c2.button("确认保存", use_container_width=True, type="primary"):
+        st.session_state.model_params["LightGBM"] = {
+            "n_estimators": new_n, "max_depth": new_md,
+            "learning_rate": new_lr, "num_leaves": new_nl, "subsample": new_ss}
+        _param_changed("LightGBM", "n_estimators", new_n, defaults["n_estimators"])
+        st.rerun()
+
+
+@st.dialog("1D-CNN 参数设置")
+def cnn_dialog():
+    params = st.session_state.model_params["1D-CNN"]
+    defaults = DEFAULT_MODEL_PARAMS["1D-CNN"]
+    new_lb = st.slider("时间步长", 10, 40, params["look_back"], 5, key="dg_cnn_lb")
+    new_fl = st.slider("卷积核", 16, 64, params["filters"], 8, key="dg_cnn_fl")
+    new_ks = st.slider("核大小", 2, 5, params["kernel_size"], 1, key="dg_cnn_ks")
+    new_do = st.slider("Dropout", 0.1, 0.4, params["dropout"], 0.05, key="dg_cnn_do")
+    new_lr = st.slider("学习率", 0.0001, 0.005, params["learning_rate"], 0.0001, key="dg_cnn_lr")
+    c1, c2 = st.columns(2)
+    if c1.button("恢复默认", use_container_width=True):
+        st.session_state.model_params["1D-CNN"] = dict(defaults)
+        st.session_state.modified_models.discard("1D-CNN")
+        st.rerun()
+    if c2.button("确认保存", use_container_width=True, type="primary"):
+        st.session_state.model_params["1D-CNN"] = {
+            "look_back": new_lb, "filters": new_fl, "kernel_size": new_ks,
+            "dropout": new_do, "learning_rate": new_lr}
+        _param_changed("1D-CNN", "filters", new_fl, defaults["filters"])
+        st.rerun()
+
+
+@st.dialog("CNN-GRU 参数设置")
+def cnn_gru_dialog():
+    params = st.session_state.model_params["CNN-GRU"]
+    defaults = DEFAULT_MODEL_PARAMS["CNN-GRU"]
+    new_cf = st.slider("卷积核", 16, 64, params["cnn_filters"], 8, key="dg_cg_cf")
+    new_ks = st.slider("核大小", 2, 5, params["kernel_size"], 1, key="dg_cg_ks")
+    new_gu = st.slider("GRU单元", 16, 64, params["gru_units"], 8, key="dg_cg_gu")
+    new_do = st.slider("Dropout", 0.1, 0.4, params["dropout"], 0.05, key="dg_cg_do")
+    new_lr = st.slider("学习率", 0.0001, 0.005, params["learning_rate"], 0.0001, key="dg_cg_lr")
+    c1, c2 = st.columns(2)
+    if c1.button("恢复默认", use_container_width=True):
+        st.session_state.model_params["CNN-GRU"] = dict(defaults)
+        st.session_state.modified_models.discard("CNN-GRU")
+        st.rerun()
+    if c2.button("确认保存", use_container_width=True, type="primary"):
+        st.session_state.model_params["CNN-GRU"] = {
+            "cnn_filters": new_cf, "kernel_size": new_ks,
+            "gru_units": new_gu, "dropout": new_do, "learning_rate": new_lr}
+        _param_changed("CNN-GRU", "cnn_filters", new_cf, defaults["cnn_filters"])
+        st.rerun()
+
+
+@st.dialog("GRU 参数设置")
+def gru_dialog():
+    params = st.session_state.model_params["GRU"]
+    defaults = DEFAULT_MODEL_PARAMS["GRU"]
+    new_un = st.slider("神经元", 16, 64, params["units"], 8, key="dg_gru_un")
+    new_lb = st.slider("时间步长", 10, 40, params["look_back"], 5, key="dg_gru_lb")
+    new_do = st.slider("Dropout", 0.1, 0.4, params["dropout"], 0.05, key="dg_gru_do")
+    new_lr = st.slider("学习率", 0.0001, 0.005, params["learning_rate"], 0.0001, key="dg_gru_lr")
+    c1, c2 = st.columns(2)
+    if c1.button("恢复默认", use_container_width=True):
+        st.session_state.model_params["GRU"] = dict(defaults)
+        st.session_state.modified_models.discard("GRU")
+        st.rerun()
+    if c2.button("确认保存", use_container_width=True, type="primary"):
+        st.session_state.model_params["GRU"] = {
+            "units": new_un, "look_back": new_lb,
+            "dropout": new_do, "learning_rate": new_lr}
+        _param_changed("GRU", "units", new_un, defaults["units"])
+        st.rerun()
+
+
+@st.dialog("LSTM 参数设置")
+def lstm_dialog():
+    params = st.session_state.model_params["LSTM"]
+    defaults = DEFAULT_MODEL_PARAMS["LSTM"]
+    new_un = st.slider("神经元", 16, 64, params["units"], 8, key="dg_lstm_un")
+    new_lb = st.slider("时间步长", 10, 40, params["look_back"], 5, key="dg_lstm_lb")
+    new_do = st.slider("Dropout", 0.1, 0.4, params["dropout"], 0.05, key="dg_lstm_do")
+    new_lr = st.slider("学习率", 0.0001, 0.005, params["learning_rate"], 0.0001, key="dg_lstm_lr")
+    c1, c2 = st.columns(2)
+    if c1.button("恢复默认", use_container_width=True):
+        st.session_state.model_params["LSTM"] = dict(defaults)
+        st.session_state.modified_models.discard("LSTM")
+        st.rerun()
+    if c2.button("确认保存", use_container_width=True, type="primary"):
+        st.session_state.model_params["LSTM"] = {
+            "units": new_un, "look_back": new_lb,
+            "dropout": new_do, "learning_rate": new_lr}
+        _param_changed("LSTM", "units", new_un, defaults["units"])
+        st.rerun()
+
+
+@st.dialog("PatchTST 参数设置")
+def patchtst_dialog():
+    params = st.session_state.model_params["PatchTST"]
+    defaults = DEFAULT_MODEL_PARAMS["PatchTST"]
+    new_dm = st.select_slider("d_model", [32, 64, 128, 256],
+                              value=params["d_model"], key="dg_pt_dm")
+    new_nh = st.select_slider("注意力头数", [2, 4, 8],
+                              value=params["n_heads"], key="dg_pt_nh")
+    new_nl = st.slider("编码器层数", 1, 4, params["n_layers"], 1, key="dg_pt_nl")
+    new_ps = st.select_slider("Patch大小", [8, 16, 32],
+                              value=params["patch_size"], key="dg_pt_ps")
+    new_do = st.slider("Dropout", 0.05, 0.3, params["dropout"], 0.05, key="dg_pt_do")
+    c1, c2 = st.columns(2)
+    if c1.button("恢复默认", use_container_width=True):
+        st.session_state.model_params["PatchTST"] = dict(defaults)
+        st.session_state.modified_models.discard("PatchTST")
+        st.rerun()
+    if c2.button("确认保存", use_container_width=True, type="primary"):
+        st.session_state.model_params["PatchTST"] = {
+            "d_model": new_dm, "n_heads": new_nh, "n_layers": new_nl,
+            "patch_size": new_ps, "dropout": new_do}
+        _param_changed("PatchTST", "d_model", new_dm, defaults["d_model"])
+        st.rerun()
+
+
+@st.dialog("TFT 参数设置")
+def tft_dialog():
+    params = st.session_state.model_params["TFT"]
+    defaults = DEFAULT_MODEL_PARAMS["TFT"]
+    new_hs = st.select_slider("隐藏层大小", [32, 64, 128],
+                              value=params["hidden_size"], key="dg_tft_hs")
+    new_nh = st.select_slider("注意力头数", [2, 4, 8],
+                              value=params["n_heads"], key="dg_tft_nh")
+    new_do = st.slider("Dropout", 0.1, 0.4, params["dropout"], 0.05, key="dg_tft_do")
+    new_nl = st.slider("LSTM层数", 1, 3, params["lstm_layers"], 1, key="dg_tft_nl")
+    c1, c2 = st.columns(2)
+    if c1.button("恢复默认", use_container_width=True):
+        st.session_state.model_params["TFT"] = dict(defaults)
+        st.session_state.modified_models.discard("TFT")
+        st.rerun()
+    if c2.button("确认保存", use_container_width=True, type="primary"):
+        st.session_state.model_params["TFT"] = {
+            "hidden_size": new_hs, "n_heads": new_nh,
+            "dropout": new_do, "lstm_layers": new_nl}
+        _param_changed("TFT", "hidden_size", new_hs, defaults["hidden_size"])
+        st.rerun()
+
+
+@st.dialog("ARIMA 参数设置")
+def arima_dialog():
+    params = st.session_state.model_params["ARIMA"]
+    defaults = DEFAULT_MODEL_PARAMS["ARIMA"]
+    new_auto = st.toggle("自动选参", value=params["auto"], key="dg_ar_auto")
+    if not new_auto:
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            new_p = st.slider("p", 0, 5, params["p"], 1, key="dg_ar_p")
+        with c2:
+            new_d = st.slider("d", 0, 2, params["d"], 1, key="dg_ar_d")
+        with c3:
+            new_q = st.slider("q", 0, 5, params["q"], 1, key="dg_ar_q")
+    else:
+        new_p, new_d, new_q = params["p"], params["d"], params["q"]
+    c1, c2 = st.columns(2)
+    if c1.button("恢复默认", use_container_width=True):
+        st.session_state.model_params["ARIMA"] = dict(defaults)
+        st.session_state.modified_models.discard("ARIMA")
+        st.rerun()
+    if c2.button("确认保存", use_container_width=True, type="primary"):
+        st.session_state.model_params["ARIMA"] = {
+            "auto": new_auto, "p": new_p, "d": new_d, "q": new_q}
+        _param_changed("ARIMA", "auto", new_auto, defaults["auto"])
+        st.rerun()
+
+
+@st.dialog("SARIMA 参数设置")
+def sarima_dialog():
+    params = st.session_state.model_params["SARIMA"]
+    defaults = DEFAULT_MODEL_PARAMS["SARIMA"]
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        new_p = st.slider("p", 0, 3, params["p"], 1, key="dg_sa_p")
+        new_d = st.slider("d", 0, 2, params["d"], 1, key="dg_sa_d")
+        new_q = st.slider("q", 0, 3, params["q"], 1, key="dg_sa_q")
+    with c2:
+        new_P = st.slider("季节P", 0, 3, params["P"], 1, key="dg_sa_P")
+        new_D = st.slider("季节D", 0, 2, params["D"], 1, key="dg_sa_D")
+        new_Q = st.slider("季节Q", 0, 3, params["Q"], 1, key="dg_sa_Q")
+    with c3:
+        new_s = st.slider("季节周期s", 3, 66, params["s"], 1, key="dg_sa_s")
+    c1, c2 = st.columns(2)
+    if c1.button("恢复默认", use_container_width=True):
+        st.session_state.model_params["SARIMA"] = dict(defaults)
+        st.session_state.modified_models.discard("SARIMA")
+        st.rerun()
+    if c2.button("确认保存", use_container_width=True, type="primary"):
+        st.session_state.model_params["SARIMA"] = {
+            "p": new_p, "d": new_d, "q": new_q,
+            "P": new_P, "D": new_D, "Q": new_Q, "s": new_s}
+        _param_changed("SARIMA", "p", new_p, defaults["p"])
+        st.rerun()
+
+
+@st.dialog("GARCH 参数说明")
+def garch_dialog():
+    st.info("GARCH(1,1) 模型参数固定，不可修改")
+    st.markdown("""
+    - **p=1**: ARCH阶数
+    - **q=1**: GARCH阶数
+    - **dist='t'**: 学生t分布（捕获厚尾特性）
+    - **mean='constant'**: 允许非零均值收益
+    """)
+    st.caption("GARCH模型用于波动率预测和风险指标计算")
 
 # ═══════ 侧边栏 ═══════
 
@@ -384,72 +683,51 @@ with st.sidebar:
     all_models = [
         "LSTM", "GRU", "1D-CNN", "CNN-GRU", "PatchTST", "TFT",
         "XGBoost", "LightGBM",
-        "ARIMA", "SARIMA", "EGARCH",
+        "ARIMA", "SARIMA", "GARCH",
     ]
     selected_models = st.multiselect("选择模型", all_models, default=all_models,
-                                      help="DL: LSTM/GRU/1D-CNN/CNN-GRU/PatchTST/TFT | 树模型: XGBoost/LightGBM | 统计: ARIMA/SARIMA/EGARCH")
+                                      help="DL: LSTM/GRU/1D-CNN/CNN-GRU/PatchTST/TFT | 树模型: XGBoost/LightGBM | 统计: ARIMA/SARIMA/GARCH")
+
+    # 模型参数设置
+    dialog_map = {
+        "XGBoost": xgboost_dialog, "LightGBM": lightgbm_dialog,
+        "1D-CNN": cnn_dialog, "CNN-GRU": cnn_gru_dialog,
+        "GRU": gru_dialog, "LSTM": lstm_dialog,
+        "PatchTST": patchtst_dialog, "TFT": tft_dialog,
+        "ARIMA": arima_dialog, "SARIMA": sarima_dialog, "GARCH": garch_dialog,
+    }
+
+    st.caption("参数设置（🔵 = 已修改）")
+    cols = st.columns(3)
+    for i, m in enumerate(all_models):
+        with cols[i % 3]:
+            mod = " 🔵" if m in st.session_state.modified_models else ""
+            if st.button(f"⚙ {m}{mod}", key=f"set_{m}", use_container_width=True):
+                dialog_map[m]()
+
     use_ensemble = st.toggle("集成预测", value=True)
 
     st.divider()
 
-    # 训练参数
+    # 通用训练参数
     st.subheader("训练参数")
     forecast_days = st.slider("预测天数", 1, 10, 5)
     look_back = st.slider("时间步长(天)", 10, 60, predict_cfg.get("default_look_back", 30))
 
     quick_mode = st.toggle("快速模式", value=False, help="减少训练轮次和模型参数，适合快速测试")
 
-    with st.expander("高级参数"):
-        if quick_mode:
-            epochs = st.slider("训练轮次", 5, 30, 10)
-        else:
-            epochs = st.slider("训练轮次", 20, 200, predict_cfg.get("dl", {}).get("epochs", 100))
-        batch_size = st.select_slider("批量大小", [8, 16, 32, 64], value=32)
-        learning_rate = st.number_input("学习率", 0.0001, 0.01, 0.001, format="%.4f")
-        dropout = st.slider("Dropout", 0.1, 0.5, 0.2)
-
-    with st.expander("Transformer参数"):
-        patchtst_cfg = predict_cfg.get("patchtst", {})
-        tft_cfg = predict_cfg.get("tft", {})
-        if quick_mode:
-            patchtst_d_model = st.select_slider("PatchTST d_model", [16, 32, 64], value=16)
-            patchtst_n_layers = st.slider("PatchTST编码器层数", 1, 2, 1)
-            tft_hidden = st.select_slider("TFT隐藏层", [8, 16, 32], value=8)
-            tft_n_heads = st.select_slider("TFT注意力头数", [1, 2, 4], value=2)
-        else:
-            patchtst_d_model = st.select_slider("PatchTST d_model", [64, 128, 256],
-                                                 value=patchtst_cfg.get("d_model", 128))
-            patchtst_n_layers = st.slider("PatchTST编码器层数", 1, 4,
-                                           patchtst_cfg.get("n_encoder_layers", 2))
-            tft_hidden = st.select_slider("TFT隐藏层", [32, 64, 128],
-                                           value=tft_cfg.get("hidden_size", 64))
-            tft_n_heads = st.select_slider("TFT注意力头数", [2, 4, 8],
-                                            value=tft_cfg.get("n_heads", 4))
-
-    with st.expander("树模型参数"):
-        if quick_mode:
-            xgb_n_estimators = st.slider("XGBoost 树数", 20, 100, 50)
-            lgb_n_estimators = st.slider("LightGBM 树数", 20, 100, 50)
-        else:
-            xgb_n_estimators = st.slider("XGBoost 树数", 50, 500, 100)
-            lgb_n_estimators = st.slider("LightGBM 树数", 50, 500, 100)
-        xgb_max_depth = st.slider("XGBoost 最大深度", 3, 15, 6)
-        xgb_lr = st.number_input("XGBoost 学习率", 0.01, 0.5, 0.1, format="%.2f")
-        lgb_max_depth = st.slider("LightGBM 最大深度", 3, 15, 6)
-        lgb_num_leaves = st.slider("LightGBM 叶子数", 10, 127, 31)
-
-    with st.expander("SARIMA参数"):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            sarima_p = st.slider("p", 0, 3, 1)
-            sarima_d = st.slider("d", 0, 2, 1)
-            sarima_q = st.slider("q", 0, 3, 1)
-        with c2:
-            sarima_P = st.slider("季节P", 0, 3, 1)
-            sarima_D = st.slider("季节D", 0, 2, 1)
-            sarima_Q = st.slider("季节Q", 0, 3, 1)
-        with c3:
-            sarima_s = st.slider("季节周期s", 3, 30, 5)
+    # DL通用参数
+    col_e, col_b = st.columns(2)
+    with col_e:
+        st.session_state.dl_epochs = st.slider(
+            "训练轮次", 5, 200,
+            st.session_state.dl_epochs if not quick_mode else min(st.session_state.dl_epochs, 30),
+            5, key="sidebar_epochs",
+            help="深度学习模型的训练轮次")
+    with col_b:
+        st.session_state.dl_batch_size = st.select_slider(
+            "批量大小", [8, 16, 32, 64],
+            value=st.session_state.dl_batch_size, key="sidebar_batch")
 
     st.divider()
 
@@ -487,13 +765,54 @@ def _build_config():
     qm = predict_cfg.get("quick_mode", {})
     pt_cfg = predict_cfg.get("patchtst", {})
     tf_cfg = predict_cfg.get("tft", {})
+    mp = st.session_state.model_params
+
+    epochs = st.session_state.dl_epochs
+    batch_size = st.session_state.dl_batch_size
 
     if quick_mode:
-        units_lstm = qm.get("lstm_units", [32, 16])
-        units_gru = qm.get("gru_units", [32, 16])
+        epochs = min(epochs, qm.get("epochs", 10))
+        units_lstm = [qm.get("lstm_units", [32, 16])[0], qm.get("lstm_units", [32, 16])[1]]
+        units_gru = [qm.get("gru_units", [32, 16])[0], qm.get("gru_units", [32, 16])[1]]
+        cnn_filters = [qm.get("cnn_filters", [32, 16])[0], qm.get("cnn_filters", [32, 16])[1]]
+        cnn_gru_cf = [qm.get("cnn_gru_filters", [32, 16])[0], qm.get("cnn_gru_filters", [32, 16])[1]]
+        cnn_gru_gu = [qm.get("cnn_gru_gru_units", [32, 16])[0], qm.get("cnn_gru_gru_units", [32, 16])[1]]
+        patchtst_d_model = qm.get("patchtst_d_model", 16)
+        patchtst_n_layers = qm.get("patchtst_n_encoder_layers", 1)
+        tft_hidden = qm.get("tft_hidden_size", 8)
+        tft_n_heads_val = qm.get("tft_n_heads", 2)
+        xgb_n_estimators = min(mp["XGBoost"]["n_estimators"], 100)
+        lgb_n_estimators = min(mp["LightGBM"]["n_estimators"], 100)
+        xgb_max_depth = mp["XGBoost"]["max_depth"]
+        xgb_lr = mp["XGBoost"]["learning_rate"]
+        lgb_max_depth = mp["LightGBM"]["max_depth"]
+        lgb_num_leaves = mp["LightGBM"]["num_leaves"]
     else:
-        units_lstm = dl_cfg.get("lstm_units", [64, 32])
-        units_gru = dl_cfg.get("gru_units", [64, 32])
+        # DL: 使用模型专属参数
+        lstm_p = mp["LSTM"]
+        gru_p = mp["GRU"]
+        cnn_p = mp["1D-CNN"]
+        cg_p = mp["CNN-GRU"]
+        pt_p = mp["PatchTST"]
+        tft_p = mp["TFT"]
+        xgb_p = mp["XGBoost"]
+        lgb_p = mp["LightGBM"]
+
+        units_lstm = [lstm_p["units"], lstm_p["units"] // 2]
+        units_gru = [gru_p["units"], gru_p["units"] // 2]
+        cnn_filters = [cnn_p["filters"], cnn_p["filters"] // 2]
+        cnn_gru_cf = [cg_p["cnn_filters"], cg_p["cnn_filters"] // 2]
+        cnn_gru_gu = [cg_p["gru_units"], cg_p["gru_units"] // 2]
+        patchtst_d_model = pt_p["d_model"]
+        patchtst_n_layers = pt_p["n_layers"]
+        tft_hidden = tft_p["hidden_size"]
+        tft_n_heads_val = tft_p["n_heads"]
+        xgb_n_estimators = xgb_p["n_estimators"]
+        xgb_max_depth = xgb_p["max_depth"]
+        xgb_lr = xgb_p["learning_rate"]
+        lgb_n_estimators = lgb_p["n_estimators"]
+        lgb_max_depth = lgb_p["max_depth"]
+        lgb_num_leaves = lgb_p["num_leaves"]
 
     # 小样本自动检测
     data = st.session_state.stock_data
@@ -501,6 +820,20 @@ def _build_config():
     if data is not None and len(data) < sm_cfg.get("threshold", 200):
         units_lstm = sm_cfg.get("lstm_units", [32, 16])
         units_gru = sm_cfg.get("gru_units", [32, 16])
+
+    sarima_p = mp["SARIMA"]
+    arima_p = mp["ARIMA"]
+    garch_p = mp["GARCH"]
+
+    # dropout 和 learning_rate：从第一个选中的DL模型获取，或使用默认值
+    dropout = dl_cfg.get("dropout", 0.2)
+    learning_rate = DL_LEARNING_RATE
+    dl_selected = [m for m in selected_models if m in ("LSTM", "GRU", "1D-CNN", "CNN-GRU", "PatchTST", "TFT")]
+    if dl_selected:
+        first_dl = dl_selected[0]
+        dl_params = mp.get(first_dl, {})
+        dropout = dl_params.get("dropout", dropout)
+        learning_rate = dl_params.get("learning_rate", learning_rate)
 
     return ModelConfig(
         look_back=look_back,
@@ -510,27 +843,36 @@ def _build_config():
         dropout=dropout,
         lstm_units=units_lstm,
         gru_units=units_gru,
-        cnn_filters=dl_cfg.get("cnn_filters", [64, 32]),
-        cnn_kernel_size=dl_cfg.get("cnn_kernel_size", 3),
+        cnn_filters=cnn_filters,
+        cnn_kernel_size=mp.get("1D-CNN", {}).get("kernel_size", dl_cfg.get("cnn_kernel_size", 3)),
+        cnn_gru_filters=cnn_gru_cf,
+        cnn_gru_gru_units=cnn_gru_gu,
+        cnn_gru_kernel_size=mp.get("CNN-GRU", {}).get("kernel_size", dl_cfg.get("cnn_kernel_size", 3)),
         early_stop_patience=3 if quick_mode else dl_cfg.get("early_stop_patience", 10),
-        patchtst_patch_size=pt_cfg.get("patch_size", 16),
-        patchtst_d_model=qm.get("patchtst_d_model", patchtst_d_model) if quick_mode else patchtst_d_model,
-        patchtst_n_heads=pt_cfg.get("n_heads", 4),
-        patchtst_n_encoder_layers=qm.get("patchtst_n_encoder_layers", patchtst_n_layers) if quick_mode else patchtst_n_layers,
-        patchtst_ff_dim=qm.get("patchtst_ff_dim", 256) if quick_mode else pt_cfg.get("ff_dim", 256),
-        patchtst_dropout=pt_cfg.get("dropout", 0.1),
-        tft_hidden_size=qm.get("tft_hidden_size", tft_hidden) if quick_mode else tft_hidden,
-        tft_n_heads=tft_n_heads,
-        tft_dropout=tf_cfg.get("dropout", 0.2),
-        tft_lstm_layers=qm.get("tft_lstm_layers", 1) if quick_mode else tf_cfg.get("lstm_layers", 1),
+        patchtst_patch_size=mp.get("PatchTST", {}).get("patch_size", pt_cfg.get("patch_size", 16)),
+        patchtst_d_model=patchtst_d_model,
+        patchtst_n_heads=mp.get("PatchTST", {}).get("n_heads", pt_cfg.get("n_heads", 4)),
+        patchtst_n_encoder_layers=patchtst_n_layers,
+        patchtst_ff_dim=pt_cfg.get("ff_dim", 256),
+        patchtst_dropout=mp.get("PatchTST", {}).get("dropout", pt_cfg.get("dropout", 0.1)),
+        tft_hidden_size=tft_hidden,
+        tft_n_heads=tft_n_heads_val,
+        tft_dropout=mp.get("TFT", {}).get("dropout", tf_cfg.get("dropout", 0.2)),
+        tft_lstm_layers=mp.get("TFT", {}).get("lstm_layers", tf_cfg.get("lstm_layers", 1)),
         xgboost_n_estimators=xgb_n_estimators,
         xgboost_max_depth=xgb_max_depth,
         xgboost_learning_rate=xgb_lr,
+        xgboost_subsample=mp["XGBoost"]["subsample"],
         lightgbm_n_estimators=lgb_n_estimators,
         lightgbm_max_depth=lgb_max_depth,
+        lightgbm_learning_rate=mp["LightGBM"]["learning_rate"],
         lightgbm_num_leaves=lgb_num_leaves,
-        sarima_order=(sarima_p, sarima_d, sarima_q),
-        sarima_seasonal_order=(sarima_P, sarima_D, sarima_Q, sarima_s),
+        lightgbm_subsample=mp["LightGBM"]["subsample"],
+        sarima_order=(sarima_p["p"], sarima_p["d"], sarima_p["q"]),
+        sarima_seasonal_order=(sarima_p["P"], sarima_p["D"], sarima_p["Q"], sarima_p["s"]),
+        garch_p=garch_p["p"],
+        garch_q=garch_p["q"],
+        garch_dist=garch_p["dist"],
     )
 
 
@@ -712,7 +1054,7 @@ if btn_train and st.session_state.stock_data is not None:
     st.subheader("实时监控")
     dl_selected = [m for m in selected_models if m in ("LSTM", "GRU", "1D-CNN", "CNN-GRU", "PatchTST", "TFT")]
     tree_selected = [m for m in selected_models if m in ("XGBoost", "LightGBM")]
-    stat_selected = [m for m in selected_models if m in ("ARIMA", "SARIMA", "EGARCH")]
+    stat_selected = [m for m in selected_models if m in ("ARIMA", "SARIMA", "GARCH")]
     all_ordered = dl_selected + tree_selected + stat_selected
 
     model_containers = {}
@@ -842,8 +1184,26 @@ if btn_train and st.session_state.stock_data is not None:
 
 # ═══════ 主界面标签页 ═══════
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-    ["数据概览", "模型训练", "预测结果", "模型评估", "模型管理", "结果导出"]
+def _chart_config(fig, height=None, title=None, xaxis_title=None, yaxis_title=None):
+    """统一图表交互配置：禁用拖拽、统一悬停、精简工具栏"""
+    fig.update_layout(
+        dragmode=False,
+        hovermode='x unified',
+        modebar_add=['zoom2d', 'resetScale2d'],
+    )
+    if height:
+        fig.update_layout(height=height)
+    if title:
+        fig.update_layout(title=title)
+    if xaxis_title:
+        fig.update_layout(xaxis_title=xaxis_title)
+    if yaxis_title:
+        fig.update_layout(yaxis_title=yaxis_title)
+    return fig
+
+
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
+    ["数据概览", "模型训练", "预测结果", "模型评估", "模型管理", "结果导出", "模型参数详情", "中长期预测"]
 )
 
 # ── Tab 1: 数据概览 ──────────────────────────────────────────
@@ -853,6 +1213,31 @@ with tab1:
         df = st.session_state.stock_data
         name = st.session_state.stock_name or ""
         code = st.session_state.stock_code or ""
+
+        # 日期范围选择器
+        st.subheader("数据范围")
+        df_full = df
+        min_date = df_full.index[0].date() if hasattr(df_full.index[0], 'date') else df_full.index[0]
+        max_date = df_full.index[-1].date() if hasattr(df_full.index[-1], 'date') else df_full.index[-1]
+        col_d1, col_d2 = st.columns(2)
+        with col_d1:
+            start_date = st.date_input(
+                "开始日期",
+                value=min_date,
+                min_value=min_date,
+                max_value=max_date,
+                key="tab1_start_date")
+        with col_d2:
+            end_date = st.date_input(
+                "结束日期",
+                value=max_date,
+                min_value=min_date,
+                max_value=max_date,
+                key="tab1_end_date")
+        mask = (df.index >= pd.Timestamp(start_date)) & (df.index <= pd.Timestamp(end_date))
+        df = df[mask]
+        if len(df) < 100:
+            st.warning(f"选择的时间段仅 {len(df)} 天数据，分析可能不够可靠")
 
         # 信息卡片
         c1, c2 = st.columns(2)
@@ -1167,16 +1552,17 @@ with tab3:
                                 annotation_text=f"跌停(-{limit_pct_display*100:.0f}%)",
                                 annotation_position="bottom right")
 
-        # 斐波那契回调水平线
+        # 波段斐波那契水平线
         if st.session_state.stock_data is not None:
-            fib_data = calculate_fibonacci_levels(st.session_state.stock_data, lookback_days=90)
-            fib_levels = fib_data["levels"]
-            for level in FIB_LEVELS:
-                if level in FIB_COLORS:
-                    fig_price.add_hline(y=fib_levels[level], line_dash="dash",
-                        line_color=FIB_COLORS[level], opacity=0.35,
-                        annotation_text=f"{FIB_NAMES[level]} ({fib_levels[level]:.1f})",
-                        annotation_position="left")
+            wave_info = detect_wave_levels(st.session_state.stock_data)
+            fib_levels = calculate_wave_fibonacci(wave_info)
+            for level_info in fib_levels:
+                line_width = 2.5 if "黄金" in level_info.get("type", "") else 1.0
+                fig_price.add_hline(y=level_info["price"], line_dash="dash",
+                    line_color=level_info["color"], opacity=0.5,
+                    annotation_text=f"{level_info['name']} ({level_info['price']:.1f})",
+                    annotation_position="left",
+                    line_width=line_width)
 
         fig_price.update_layout(height=500, title="收盘价预测走势（含置信区间）",
                                 xaxis_title="日期", yaxis_title="价格(¥)")
@@ -1189,24 +1575,56 @@ with tab3:
             lower_limit = last_price * (1 - limit_pct_display)
             st.info(f"板块: **{board}** | 涨跌停限制: ±**{limit_pct_display*100:.0f}%** | 涨停价: ¥{upper_limit:.2f} | 跌停价: ¥{lower_limit:.2f}")
 
-        # 斐波那契交易信号
+        # 波段斐波那契交易信号
         if st.session_state.stock_data is not None:
-            fib_signals = generate_fibonacci_signals(last_price, fib_data, preds)
+            wave_info = detect_wave_levels(st.session_state.stock_data)
+            fib_levels = calculate_wave_fibonacci(wave_info)
+            # 计算相对成交量
+            if "相对成交量" in st.session_state.stock_data.columns:
+                rel_vol = float(st.session_state.stock_data["相对成交量"].dropna().iloc[-1])
+            else:
+                vol = st.session_state.stock_data["volume"]
+                rel_vol = float(vol.iloc[-1] / vol.tail(20).mean()) if len(vol) >= 20 else 1.0
+            model_pred = float(preds["daily_return"][0]) if len(preds["daily_return"]) > 0 else 0
+            fib_signals = generate_wave_fib_signals(
+                last_price, fib_levels, wave_info, model_pred, rel_vol)
             if fib_signals:
-                st.subheader("斐波那契交易信号")
+                st.subheader("波段斐波那契交易信号")
+                # 波段信息
+                st.caption(f"波段趋势: **{wave_info['trend']}** | "
+                          f"波段起点: ¥{wave_info['wave_start']:.2f} ({wave_info['start_date'].strftime('%Y-%m-%d') if hasattr(wave_info['start_date'], 'strftime') else wave_info['start_date']}) | "
+                          f"波段终点: ¥{wave_info['wave_end']:.2f} ({wave_info['end_date'].strftime('%Y-%m-%d') if hasattr(wave_info['end_date'], 'strftime') else wave_info['end_date']}) | "
+                          f"波段涨跌幅: {wave_info['wave_return']*100:.1f}%")
+
+                # 斐波那契价位表格
+                st.markdown("**关键黄金分割价位**")
+                fib_table_data = []
+                for lv in sorted(fib_levels, key=lambda x: x["price"]):
+                    bg = None
+                    if "黄金" in lv.get("type", ""):
+                        bg = "gold"
+                    elif abs(lv["price"] - last_price) / last_price < 0.01:
+                        bg = "lightblue"
+                    fib_table_data.append({
+                        "价位名称": lv["name"],
+                        "价格": f"¥{lv['price']:.2f}",
+                        "类型": lv["type"],
+                        "距当前价": f"{(lv['price']/last_price - 1)*100:+.1f}%",
+                    })
+                fib_df = pd.DataFrame(fib_table_data)
+                st.dataframe(fib_df, use_container_width=True, hide_index=True)
+
+                # 信号展示
                 for s in fib_signals:
-                    if s["signal"] == "buy":
-                        st.success(f"**[买入信号]** {s['description']}")
-                    elif s["signal"] == "sell":
-                        st.warning(f"**[卖出信号]** {s['description']}")
-                buy_count = sum(1 for s in fib_signals if s["signal"] == "buy")
-                sell_count = sum(1 for s in fib_signals if s["signal"] == "sell")
-                if buy_count > sell_count:
-                    st.success(f"斐波那契分析: **偏向看多** ({buy_count} 买入 vs {sell_count} 卖出)")
-                elif sell_count > buy_count:
-                    st.warning(f"斐波那契分析: **偏向看空** ({sell_count} 卖出 vs {buy_count} 买入)")
-                else:
-                    st.info("斐波那契分析: **中性观望**")
+                    signal_type = s["type"]
+                    if signal_type in ("强买入", "买入"):
+                        st.success(f"**[{signal_type}]** {s['reason']} (置信度: {'★'*s['confidence']})")
+                    elif signal_type in ("强卖出", "卖出", "止损/清仓"):
+                        st.error(f"**[{signal_type}]** {s['reason']} (置信度: {'★'*s['confidence']})")
+                    elif signal_type in ("止盈", "轻仓抄底"):
+                        st.warning(f"**[{signal_type}]** {s['reason']} (置信度: {'★'*s['confidence']})")
+                    else:
+                        st.info(f"**[{signal_type}]** {s['reason']} (置信度: {'★'*s['confidence']})")
 
         # 各模型对比
         if preds.get("model_predictions"):
@@ -1223,6 +1641,22 @@ with tab3:
             fig_cmp.update_layout(height=400, title="各模型预测价格对比",
                                   xaxis_title="日期", yaxis_title="价格(¥)")
             st.plotly_chart(fig_cmp, use_container_width=True)
+
+        # 中长期预测联动
+        if st.session_state.longterm_results is not None:
+            lt = st.session_state.longterm_results
+            ensemble = lt.get("_ensemble", {})
+            lt_pred = ensemble.get("prediction", 0) * 100
+            valid_lt_models = [m for m in lt if m != "_ensemble" and not np.isnan(lt[m].get("cv_rmse", float("nan")))]
+            lt_dir_acc = np.mean([lt[m]["direction_accuracy"] for m in valid_lt_models]) if valid_lt_models else 0.5
+            lt_rating = get_rating(lt_pred, lt_dir_acc)
+            lt_period = st.session_state.get("longterm_period", "N/A")
+            suggestion = "可继续持有" if lt_pred > 0 else "建议减仓观望"
+            if lt_pred > 10:
+                suggestion = "强烈建议持有/加仓"
+            elif lt_pred < -10:
+                suggestion = "强烈建议减仓/止损"
+            st.info(f"**中长期预测 ({lt_period})**: 累计收益率预测 **{lt_pred:+.1f}%** | 评级: **{lt_rating}** | {suggestion}")
     else:
         st.info("请先训练模型生成预测")
 
@@ -1466,6 +1900,39 @@ with tab6:
                     metrics_rows.append(row)
                 pd.DataFrame(metrics_rows).to_excel(writer, sheet_name="评估指标", index=False)
 
+            # 中长期预测结果
+            if st.session_state.longterm_results is not None:
+                lt = st.session_state.longterm_results
+                ensemble = lt.get("_ensemble", {})
+                lt_pred = ensemble.get("prediction", 0)
+                lt_period = st.session_state.get("longterm_period", "N/A")
+
+                # 汇总卡片
+                lt_summary = pd.DataFrame({
+                    "项目": ["预测周期", "集成预测收益率", "最新周收盘价", "预测目标价"],
+                    "值": [lt_period, f"{lt_pred*100:+.2f}%",
+                          f"¥{ensemble.get('latest_close', 0):.2f}",
+                          f"¥{ensemble.get('latest_close', 0)*(1+lt_pred):.2f}"],
+                })
+                lt_summary.to_excel(writer, sheet_name="中长期预测", index=False, startrow=0)
+
+                # 模型对比
+                lt_model_rows = []
+                for name, r in lt.items():
+                    if name == "_ensemble":
+                        continue
+                    lt_model_rows.append({
+                        "模型": name,
+                        "预测收益率": f"{r['prediction']*100:+.2f}%",
+                        "CV_RMSE": r.get("cv_rmse", "N/A"),
+                        "CV_R²": r.get("cv_r2", "N/A"),
+                        "方向准确率": f"{r.get('direction_accuracy', 0)*100:.1f}%",
+                    })
+                if lt_model_rows:
+                    pd.DataFrame(lt_model_rows).to_excel(
+                        writer, sheet_name="中长期预测", index=False,
+                        startrow=len(lt_summary) + 3)
+
         buf.seek(0)
         st.download_button(
             "下载 Excel 报告",
@@ -1479,6 +1946,275 @@ with tab6:
         st.info("图表可在各标签页中点击右上角相机图标直接下载 PNG")
     else:
         st.info("请先训练模型生成预测结果")
+
+
+# ── Tab 7: 模型参数详情 ──────────────────────────────────────────
+
+with tab7:
+    st.subheader("模型参数详情")
+
+    last_config = st.session_state.get("_last_config")
+    if last_config:
+        st.markdown("### 训练配置摘要")
+        st.markdown(f"- 时间步长: **{last_config.look_back}** 天")
+        st.markdown(f"- 训练轮次: **{last_config.epochs}**")
+        st.markdown(f"- 批量大小: **{last_config.batch_size}**")
+        st.markdown(f"- 学习率: **{last_config.learning_rate:.6f}**")
+        st.markdown(f"- Dropout: **{last_config.dropout}**")
+
+    if st.session_state.train_results:
+        st.markdown("---")
+        st.markdown("### 各模型参数表")
+
+        all_models_list = [
+            "LSTM", "GRU", "1D-CNN", "CNN-GRU", "PatchTST", "TFT",
+            "XGBoost", "LightGBM", "ARIMA", "SARIMA", "GARCH",
+        ]
+        model_labels = {
+            "LSTM": "LSTM", "GRU": "GRU", "1D-CNN": "1D-CNN",
+            "CNN-GRU": "CNN-GRU", "PatchTST": "PatchTST", "TFT": "TFT",
+            "XGBoost": "XGBoost", "LightGBM": "LightGBM",
+            "ARIMA": "ARIMA", "SARIMA": "SARIMA", "GARCH": "GARCH",
+        }
+
+        mp = st.session_state.model_params
+        for model_name in all_models_list:
+            params = mp.get(model_name, {})
+            defaults = DEFAULT_MODEL_PARAMS.get(model_name, {})
+            if not params:
+                continue
+
+            is_trained = model_name in st.session_state.train_results
+            status_icon = "✅" if is_trained else "⚪"
+            is_modified = model_name in st.session_state.modified_models
+            mod_icon = " 🔵" if is_modified else ""
+
+            st.markdown(f"**{status_icon} {model_labels.get(model_name, model_name)}{mod_icon}**")
+
+            rows = []
+            for key, val in params.items():
+                def_val = defaults.get(key, "—")
+                if isinstance(val, float):
+                    val_str = f"{val:.4f}" if val < 0.01 else f"{val:.2f}"
+                else:
+                    val_str = str(val)
+                if isinstance(def_val, float):
+                    def_str = f"{def_val:.4f}" if abs(def_val) < 0.01 else f"{def_val:.2f}"
+                else:
+                    def_str = str(def_val)
+                rows.append({
+                    "参数名称": key,
+                    "当前值": val_str,
+                    "默认值": def_str,
+                    "已修改": "是" if val != def_val else "否",
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        # 训练结果汇总
+        st.markdown("---")
+        st.markdown("### 训练指标汇总")
+        metric_rows = []
+        for name, r in st.session_state.train_results.items():
+            m = r.cv_metrics
+            metric_rows.append({
+                "模型": name,
+                "MAE": f"{m.get('mae', 'N/A')}",
+                "RMSE": f"{m.get('rmse', 'N/A')}",
+                "R²": f"{m.get('r2', 'N/A')}",
+                "训练耗时(s)": f"{r.training_time:.1f}",
+            })
+        st.dataframe(pd.DataFrame(metric_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("请先训练模型以查看参数详情")
+
+
+# ── Tab 8: 中长期预测 ──────────────────────────────────────────
+
+with tab8:
+    st.subheader("1-3月中长期收益率预测")
+    st.caption("基于周线数据，使用树模型（LightGBM/XGBoost/CatBoost）预测未来累计收益率")
+
+    if st.session_state.stock_data is not None:
+        df = st.session_state.stock_data
+
+        # ── 参数设置 ──
+        col_p1, col_p2 = st.columns(2)
+        with col_p1:
+            period_label = st.radio(
+                "预测周期",
+                ["1个月 (4周)", "2个月 (8周)", "3个月 (12周)"],
+                key="longterm_period",
+                horizontal=True,
+            )
+        with col_p2:
+            lt_models = st.multiselect(
+                "选择模型",
+                ["LightGBM", "XGBoost", "CatBoost", "LinearRegression"],
+                default=["LightGBM", "XGBoost", "CatBoost"],
+                key="longterm_models",
+            )
+
+        horizon_map = {"1个月 (4周)": 4, "2个月 (8周)": 8, "3个月 (12周)": 12}
+        horizon_weeks = horizon_map[period_label]
+
+        # ── 数据准备 ──
+        weekly_info = resample_to_weekly(df)
+        df_weekly = weekly_info["df_weekly"]
+        data_warning = weekly_info["data_warning"]
+
+        if data_warning:
+            st.warning(data_warning)
+
+        # ── 训练按钮 ──
+        if st.button("开始中长期预测", type="primary", use_container_width=True,
+                     disabled=len(lt_models) == 0):
+            with st.spinner(f"训练中长期模型（{period_label}）..."):
+                try:
+                    lt_results = train_long_term_models(
+                        df_weekly, lt_models, horizon_weeks,
+                    )
+                    st.session_state.longterm_results = lt_results
+                    st.toast("中长期预测完成!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"训练失败: {e}")
+                    import traceback
+                    st.code(traceback.format_exc())
+
+        # ── 结果展示 ──
+        if st.session_state.longterm_results is not None:
+            lt = st.session_state.longterm_results
+            ensemble = lt.get("_ensemble", {})
+            ensemble_pred = ensemble.get("prediction", 0)
+            latest_close = ensemble.get("latest_close", df_weekly["收盘"].iloc[-1])
+
+            st.divider()
+            st.subheader("预测结果")
+
+            # 1. 综合预测卡片
+            pred_return_pct = ensemble_pred * 100  # 转百分比
+            valid_models = [m for m in lt if m != "_ensemble" and not np.isnan(lt[m].get("cv_rmse", float("nan")))]
+            avg_dir_acc = np.mean([lt[m]["direction_accuracy"] for m in valid_models]) if valid_models else 0.5
+            rating = get_rating(pred_return_pct, avg_dir_acc)
+
+            ci_lows = [lt[m]["confidence_interval"][0] * 100 for m in valid_models]
+            ci_highs = [lt[m]["confidence_interval"][1] * 100 for m in valid_models]
+            ci_low_pct = np.mean(ci_lows) if ci_lows else pred_return_pct * 0.5
+            ci_high_pct = np.mean(ci_highs) if ci_highs else pred_return_pct * 1.5
+            up_prob = avg_dir_acc
+
+            rating_colors = {
+                "强烈看涨": "#006600", "看涨": "#009900", "中性": "#666666",
+                "看跌": "#cc0000", "强烈看跌": "#990000",
+            }
+
+            card_cols = st.columns(4)
+            with card_cols[0]:
+                delta_str = f"{pred_return_pct:+.1f}%"
+                st.metric("预测累计收益率", delta_str)
+            with card_cols[1]:
+                st.metric("上涨概率", f"{up_prob*100:.0f}%")
+            with card_cols[2]:
+                st.metric("95%置信区间", f"{ci_low_pct:+.1f}% ~ {ci_high_pct:+.1f}%")
+            with card_cols[3]:
+                color = rating_colors.get(rating, "#666666")
+                st.markdown(
+                    f"<div style='text-align:center;font-size:1.5em;font-weight:bold;color:{color}'>{rating}</div>",
+                    unsafe_allow_html=True)
+                st.caption("综合评级")
+
+            # 2. 模型对比表
+            st.subheader("各模型预测对比")
+            model_rows = []
+            for name in lt_models:
+                if name not in lt or name == "_ensemble":
+                    continue
+                r = lt[name]
+                model_rows.append({
+                    "模型": name,
+                    "预测收益率": f"{r['prediction']*100:+.2f}%",
+                    "RMSE": f"{r.get('cv_rmse', 'N/A'):.4f}" if not np.isnan(r.get('cv_rmse', float('nan'))) else "N/A",
+                    "R²": f"{r.get('cv_r2', 'N/A'):.4f}" if not np.isnan(r.get('cv_r2', float('nan'))) else "N/A",
+                    "方向准确率": f"{r.get('direction_accuracy', 0)*100:.1f}%",
+                })
+            model_rows.sort(key=lambda x: float(x["预测收益率"].replace("%", "").replace("+", "")), reverse=True)
+            st.dataframe(pd.DataFrame(model_rows), use_container_width=True, hide_index=True)
+
+            # 3. 趋势图（含斐波那契）
+            st.subheader("周线趋势预测")
+            hist_weeks = min(52, len(df_weekly))
+            hist_data = df_weekly.tail(hist_weeks)
+            hist_dates = hist_data.index
+            hist_close = hist_data["收盘"].values
+
+            future_close = latest_close * (1 + ensemble_pred)
+            future_date = hist_dates[-1] + pd.Timedelta(weeks=horizon_weeks)
+
+            fig_weekly = go.Figure()
+            fig_weekly.add_trace(go.Scatter(
+                x=hist_dates, y=hist_close,
+                name="历史周线收盘价", line=dict(color="#1f77b4", width=2),
+                mode="lines"))
+            fig_weekly.add_trace(go.Scatter(
+                x=[hist_dates[-1], future_date],
+                y=[latest_close, future_close],
+                name=f"预测({horizon_weeks}周)", line=dict(color="red", width=2.5, dash="dot"),
+                mode="lines+markers"))
+
+            ci_low_price = latest_close * (1 + ci_low_pct / 100)
+            ci_high_price = latest_close * (1 + ci_high_pct / 100)
+            fig_weekly.add_trace(go.Scatter(
+                x=[hist_dates[-1], future_date, future_date, hist_dates[-1]],
+                y=[ci_low_price, ci_low_price, ci_high_price, ci_high_price],
+                fill="toself", fillcolor="rgba(255,0,0,0.1)",
+                line=dict(color="rgba(255,0,0,0)"), name="95%置信区间"))
+
+            # 斐波那契水平线
+            try:
+                wave_info = detect_wave_levels(df_weekly.rename(columns={"收盘": "close"}))
+                fib_levels = calculate_wave_fibonacci(wave_info)
+                for lv in fib_levels:
+                    line_w = 2.5 if "黄金" in lv.get("type", "") else 1.0
+                    fig_weekly.add_hline(y=lv["price"], line_dash="dash",
+                        line_color=lv["color"], opacity=0.4,
+                        annotation_text=f"{lv['name']}",
+                        annotation_position="left", line_width=line_w)
+            except Exception:
+                pass
+
+            fig_weekly.update_layout(height=450, title=f"周线收盘价 + {horizon_weeks}周预测",
+                                    xaxis_title="日期", yaxis_title="价格(¥)",
+                                    hovermode="x unified")
+            st.plotly_chart(fig_weekly, use_container_width=True)
+
+            # 4. 风险评估
+            risk = assess_risk(df_weekly)
+            st.subheader("风险评估")
+            risk_cols = st.columns(4)
+            risk_cols[0].metric("年化波动率", f"{risk['annual_vol_pct']}%")
+            risk_cols[1].metric("最大回撤预期", f"{risk['max_drawdown_pct']}%")
+            risk_level_color = {"低": "green", "中": "orange", "高": "red"}
+            risk_cols[2].metric("风险等级", risk["risk_level"])
+
+            # 5. 特征重要性
+            st.subheader("特征重要性分析 (LightGBM)")
+            lgb_result = lt.get("LightGBM", {})
+            lgb_feat_imp = lgb_result.get("feature_importance", {})
+            if lgb_feat_imp:
+                sorted_imp = sorted(lgb_feat_imp.items(), key=lambda x: x[1], reverse=True)[:10]
+                fig_imp = go.Figure(go.Bar(
+                    x=[v for _, v in sorted_imp],
+                    y=[k for k, _ in sorted_imp],
+                    orientation="h",
+                    marker_color="#1f77b4",
+                ))
+                fig_imp.update_layout(height=350, title="Top 10 特征重要性",
+                                     xaxis_title="重要性", yaxis_title="特征")
+                st.plotly_chart(fig_imp, use_container_width=True)
+            else:
+                st.info("LightGBM 未训练或无法获取特征重要性")
+    else:
+        st.info("请先在侧边栏加载数据")
 
 
 # ═══════ 导出按钮处理 ═══════
