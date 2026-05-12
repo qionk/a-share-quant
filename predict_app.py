@@ -280,7 +280,7 @@ elif orphan_status == "orphaned":
 def xgboost_dialog():
     params = st.session_state.model_params["XGBoost"]
     defaults = DEFAULT_MODEL_PARAMS["XGBoost"]
-    new_lr = st.slider("学习率", 0.01, 0.30, params["learning_rate"], 0.01, key="dg_xgb_lr")
+    new_lr = st.slider("学习率", 0.01, 0.30, params["learning_rate"], 0.01, format="%.2f", key="dg_xgb_lr")
     new_n = st.slider("树数量", 50, 300, params["n_estimators"], 10, key="dg_xgb_n")
     new_md = st.slider("最大深度", 3, 10, params["max_depth"], 1, key="dg_xgb_md")
     new_ss = st.slider("子样本", 0.5, 1.0, params["subsample"], 0.05, key="dg_xgb_ss")
@@ -301,7 +301,7 @@ def xgboost_dialog():
 def lightgbm_dialog():
     params = st.session_state.model_params["LightGBM"]
     defaults = DEFAULT_MODEL_PARAMS["LightGBM"]
-    new_lr = st.slider("学习率", 0.01, 0.30, params["learning_rate"], 0.01, key="dg_lgb_lr")
+    new_lr = st.slider("学习率", 0.01, 0.30, params["learning_rate"], 0.01, format="%.2f", key="dg_lgb_lr")
     new_n = st.slider("树数量", 50, 300, params["n_estimators"], 10, key="dg_lgb_n")
     new_md = st.slider("最大深度", 3, 10, params["max_depth"], 1, key="dg_lgb_md")
     new_nl = st.slider("叶子数", 15, 127, params["num_leaves"], 2, key="dg_lgb_nl")
@@ -327,7 +327,7 @@ def cnn_dialog():
     new_fl = st.slider("卷积核", 16, 64, params["filters"], 8, key="dg_cnn_fl")
     new_ks = st.slider("核大小", 2, 5, params["kernel_size"], 1, key="dg_cnn_ks")
     new_do = st.slider("Dropout", 0.1, 0.4, params["dropout"], 0.05, key="dg_cnn_do")
-    new_lr = st.slider("学习率", 0.0001, 0.005, params["learning_rate"], 0.0001, key="dg_cnn_lr")
+    new_lr = st.slider("学习率", 0.0001, 0.005, params["learning_rate"], 0.0001, format="%.4f", key="dg_cnn_lr")
     c1, c2 = st.columns(2)
     if c1.button("恢复默认", use_container_width=True):
         st.session_state.model_params["1D-CNN"] = dict(defaults)
@@ -349,7 +349,7 @@ def cnn_gru_dialog():
     new_ks = st.slider("核大小", 2, 5, params["kernel_size"], 1, key="dg_cg_ks")
     new_gu = st.slider("GRU单元", 16, 64, params["gru_units"], 8, key="dg_cg_gu")
     new_do = st.slider("Dropout", 0.1, 0.4, params["dropout"], 0.05, key="dg_cg_do")
-    new_lr = st.slider("学习率", 0.0001, 0.005, params["learning_rate"], 0.0001, key="dg_cg_lr")
+    new_lr = st.slider("学习率", 0.0001, 0.005, params["learning_rate"], 0.0001, format="%.4f", key="dg_cg_lr")
     c1, c2 = st.columns(2)
     if c1.button("恢复默认", use_container_width=True):
         st.session_state.model_params["CNN-GRU"] = dict(defaults)
@@ -370,7 +370,7 @@ def gru_dialog():
     new_un = st.slider("神经元", 16, 64, params["units"], 8, key="dg_gru_un")
     new_lb = st.slider("时间步长", 10, 40, params["look_back"], 5, key="dg_gru_lb")
     new_do = st.slider("Dropout", 0.1, 0.4, params["dropout"], 0.05, key="dg_gru_do")
-    new_lr = st.slider("学习率", 0.0001, 0.005, params["learning_rate"], 0.0001, key="dg_gru_lr")
+    new_lr = st.slider("学习率", 0.0001, 0.005, params["learning_rate"], 0.0001, format="%.4f", key="dg_gru_lr")
     c1, c2 = st.columns(2)
     if c1.button("恢复默认", use_container_width=True):
         st.session_state.model_params["GRU"] = dict(defaults)
@@ -391,7 +391,7 @@ def lstm_dialog():
     new_un = st.slider("神经元", 16, 64, params["units"], 8, key="dg_lstm_un")
     new_lb = st.slider("时间步长", 10, 40, params["look_back"], 5, key="dg_lstm_lb")
     new_do = st.slider("Dropout", 0.1, 0.4, params["dropout"], 0.05, key="dg_lstm_do")
-    new_lr = st.slider("学习率", 0.0001, 0.005, params["learning_rate"], 0.0001, key="dg_lstm_lr")
+    new_lr = st.slider("学习率", 0.0001, 0.005, params["learning_rate"], 0.0001, format="%.4f", key="dg_lstm_lr")
     c1, c2 = st.columns(2)
     if c1.button("恢复默认", use_container_width=True):
         st.session_state.model_params["LSTM"] = dict(defaults)
@@ -1672,25 +1672,22 @@ with tab4:
         model_sel = st.selectbox("选择模型查看", list(results.keys()), key="eval_model")
         r = results[model_sel]
 
-        has_test_data = len(r.test_predictions) > 0 and len(r.test_actuals) > 0
+        has_test_data = len(r.test_returns) > 0 and len(r.test_returns_actual) > 0
         if not has_test_data:
             st.info("云端加载的结果不含测试集数据，仅展示模型指标")
 
         if has_test_data:
+            n_test = len(r.test_returns_actual)
+            df_full = st.session_state.stock_data
+            test_dates = df_full.index[-n_test:] if df_full is not None and len(df_full) >= n_test else list(range(n_test))
+
             fig_vs = go.Figure()
-            x_range = list(range(len(r.test_actuals)))
-            fig_vs.add_trace(go.Scatter(x=x_range, y=r.test_actuals,
+            fig_vs.add_trace(go.Scatter(x=test_dates, y=r.test_returns_actual,
                                         name="实际值", line=dict(color="blue")))
-            fig_vs.add_trace(go.Scatter(x=x_range, y=r.test_predictions,
+            fig_vs.add_trace(go.Scatter(x=test_dates, y=r.test_returns,
                                         name="预测值", line=dict(color="red", dash="dash")))
-            if len(r.confidence_lower) > 0:
-                fig_vs.add_trace(go.Scatter(
-                    x=x_range + x_range[::-1],
-                    y=list(r.confidence_upper) + list(r.confidence_lower[::-1]),
-                    fill="toself", fillcolor="rgba(255,0,0,0.1)",
-                    line=dict(color="rgba(0,0,0,0)"), name="95%置信"))
             fig_vs.update_layout(height=400, title=f"{model_sel} - 测试集预测效果",
-                                 xaxis_title="样本", yaxis_title="价格")
+                                 xaxis_title="日期", yaxis_title="收益率(%)")
             st.plotly_chart(fig_vs, use_container_width=True)
 
         # 指标对比柱状图
