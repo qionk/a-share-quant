@@ -190,7 +190,7 @@ DEFAULT_MODEL_PARAMS = {
     "XGBoost": {"n_estimators": 100, "max_depth": 6, "learning_rate": 0.1, "subsample": 0.8},
     "LightGBM": {"n_estimators": 100, "max_depth": 6, "learning_rate": 0.1, "num_leaves": 31, "subsample": 0.8},
     "1D-CNN": {"look_back": 30, "filters": 32, "kernel_size": 3, "dropout": 0.2, "learning_rate": 0.001},
-    "CNN-GRU": {"cnn_filters": 64, "kernel_size": 3, "gru_units": 32, "dropout": 0.2, "learning_rate": 0.001},
+    "CNN-GRU": {"cnn_filters": 32, "kernel_size": 3, "gru_units": 24, "dropout": 0.2, "learning_rate": 0.0006},
     "GRU": {"units": 32, "look_back": 30, "dropout": 0.2, "learning_rate": 0.001},
     "LSTM": {"units": 32, "look_back": 30, "dropout": 0.2, "learning_rate": 0.001},
     "PatchTST": {"d_model": 128, "n_heads": 4, "n_layers": 2, "patch_size": 16, "dropout": 0.1},
@@ -776,7 +776,7 @@ def _build_config():
         units_gru = [qm.get("gru_units", [32, 16])[0], qm.get("gru_units", [32, 16])[1]]
         cnn_filters = [qm.get("cnn_filters", [32, 16])[0], qm.get("cnn_filters", [32, 16])[1]]
         cnn_gru_cf = [qm.get("cnn_gru_filters", [32, 16])[0], qm.get("cnn_gru_filters", [32, 16])[1]]
-        cnn_gru_gu = [qm.get("cnn_gru_gru_units", [32, 16])[0], qm.get("cnn_gru_gru_units", [32, 16])[1]]
+        cnn_gru_gu = [qm.get("cnn_gru_gru_units", [24])[0]]
         patchtst_d_model = qm.get("patchtst_d_model", 16)
         patchtst_n_layers = qm.get("patchtst_n_encoder_layers", 1)
         tft_hidden = qm.get("tft_hidden_size", 8)
@@ -802,7 +802,7 @@ def _build_config():
         units_gru = [gru_p["units"], gru_p["units"] // 2]
         cnn_filters = [cnn_p["filters"], cnn_p["filters"] // 2]
         cnn_gru_cf = [cg_p["cnn_filters"], cg_p["cnn_filters"] // 2]
-        cnn_gru_gu = [cg_p["gru_units"], cg_p["gru_units"] // 2]
+        cnn_gru_gu = [cg_p["gru_units"]]
         patchtst_d_model = pt_p["d_model"]
         patchtst_n_layers = pt_p["n_layers"]
         tft_hidden = tft_p["hidden_size"]

@@ -39,8 +39,8 @@ class ModelConfig:
     tft_dropout: float = 0.2
     tft_lstm_layers: int = 1
     # CNN-GRU
-    cnn_gru_filters: list = field(default_factory=lambda: [64, 32])
-    cnn_gru_gru_units: list = field(default_factory=lambda: [64, 32])
+    cnn_gru_filters: list = field(default_factory=lambda: [32, 16])
+    cnn_gru_gru_units: list = field(default_factory=lambda: [24])
     cnn_gru_kernel_size: int = 3
     # XGBoost
     xgboost_n_estimators: int = 100
@@ -162,34 +162,24 @@ def build_cnn(config: ModelConfig):
 
 def build_cnn_gru(config: ModelConfig):
     """
-    CNN-GRU 混合模型:
-    Conv1D → MaxPool → Conv1D → MaxPool → GRU → Dropout → GRU → Dropout → Dense(1)
+    CNN-GRU 混合模型（优化版）:
+    Conv1D(32) → Conv1D(16) → GRU(24) → Dropout → Dense(1)
+    移除 MaxPooling 防信息丢失，单层 GRU 减过拟合，去除冗余 Dense 层
     """
     _set_seed()
     import tensorflow as tf
     from tensorflow.keras.models import Sequential
     from tensorflow.keras.layers import (
-        Conv1D, MaxPooling1D, GRU, Dense, Dropout, Input
+        Conv1D, GRU, Dense, Dropout, Input
     )
 
-    seq_len = config.look_back
-    layers = [Input(shape=(seq_len, config.n_features))]
+    layers = [Input(shape=(config.look_back, config.n_features))]
     layers.append(Conv1D(config.cnn_gru_filters[0], config.cnn_gru_kernel_size,
-                         activation="relu", padding="same"))
-    if seq_len >= 4:
-        layers.append(MaxPooling1D(pool_size=2))
-        seq_len //= 2
-
+                         activation="relu", padding="valid"))
     layers.append(Conv1D(config.cnn_gru_filters[1], config.cnn_gru_kernel_size,
-                         activation="relu", padding="same"))
-    if seq_len >= 4:
-        layers.append(MaxPooling1D(pool_size=2))
-
-    layers.append(GRU(config.cnn_gru_gru_units[0], return_sequences=True))
+                         activation="relu", padding="valid"))
+    layers.append(GRU(config.cnn_gru_gru_units[0], return_sequences=False))
     layers.append(Dropout(config.dropout))
-    layers.append(GRU(config.cnn_gru_gru_units[1]))
-    layers.append(Dropout(config.dropout))
-    layers.append(Dense(16, activation="relu"))
     layers.append(Dense(1))
 
     model = Sequential(layers)
