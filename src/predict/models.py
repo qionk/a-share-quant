@@ -52,6 +52,7 @@ class ModelConfig:
     lightgbm_max_depth: int = 6
     lightgbm_learning_rate: float = 0.1
     lightgbm_num_leaves: int = 31
+    lightgbm_subsample: float = 0.8
     # SARIMA
     sarima_order: tuple = (1, 1, 1)
     sarima_seasonal_order: tuple = (1, 1, 1, 5)
