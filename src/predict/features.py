@@ -46,7 +46,7 @@ def compute_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     # 涨跌幅（若不存在则计算）
     if "pct_change" not in df.columns or df["pct_change"].isna().all():
-        df["pct_change"] = close.pct_change() * 100
+        df["pct_change"] = close.pct_change()
 
     # 成交量均线
     df["vol_ma5"] = volume.rolling(5).mean()
@@ -65,7 +65,7 @@ def compute_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["vol_price_corr"] = volume.rolling(20).corr(close)
 
     # 成交量动量 (5日变化率)
-    df["vol_momentum"] = volume.pct_change(5) * 100
+    df["vol_momentum"] = volume.pct_change(5)
 
     # 日收益率5日均线（平滑后的收益率趋势）
     if '日收益率' in df.columns:

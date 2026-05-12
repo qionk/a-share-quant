@@ -53,6 +53,13 @@ class ModelConfig:
     lightgbm_learning_rate: float = 0.1
     lightgbm_num_leaves: int = 31
     lightgbm_subsample: float = 0.8
+    # Per-model DL learning rates
+    lstm_lr: float = 0.001
+    gru_lr: float = 0.001
+    cnn_lr: float = 0.001
+    cnn_gru_lr: float = 0.001
+    patchtst_lr: float = 0.001
+    tft_lr: float = 0.001
     # SARIMA
     sarima_order: tuple = (1, 1, 1)
     sarima_seasonal_order: tuple = (1, 1, 1, 5)
@@ -88,7 +95,7 @@ def build_lstm(config: ModelConfig):
         Dense(1),
     ])
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=config.learning_rate),
+        optimizer=tf.keras.optimizers.Adam(learning_rate=config.lstm_lr),
         loss="mse",
     )
     return model
@@ -113,7 +120,7 @@ def build_gru(config: ModelConfig):
         Dense(1),
     ])
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=config.learning_rate),
+        optimizer=tf.keras.optimizers.Adam(learning_rate=config.gru_lr),
         loss="mse",
     )
     return model
@@ -154,7 +161,7 @@ def build_cnn(config: ModelConfig):
 
     model = Sequential(layers)
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=config.learning_rate),
+        optimizer=tf.keras.optimizers.Adam(learning_rate=config.cnn_lr),
         loss="mse",
     )
     return model
@@ -184,7 +191,7 @@ def build_cnn_gru(config: ModelConfig):
 
     model = Sequential(layers)
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=config.learning_rate),
+        optimizer=tf.keras.optimizers.Adam(learning_rate=config.cnn_gru_lr),
         loss="mse",
     )
     return model
@@ -246,7 +253,7 @@ def build_patchtst(config: ModelConfig):
 
     model = Model(inputs=inputs, outputs=outputs, name="PatchTST")
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=config.learning_rate),
+        optimizer=tf.keras.optimizers.Adam(learning_rate=config.patchtst_lr),
         loss="mse",
     )
     return model
@@ -328,7 +335,7 @@ def build_tft(config: ModelConfig):
 
     model = Model(inputs=inputs, outputs=outputs, name="TFT")
     model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=config.learning_rate),
+        optimizer=tf.keras.optimizers.Adam(learning_rate=config.tft_lr),
         loss="mse",
     )
     return model

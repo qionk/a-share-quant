@@ -44,10 +44,7 @@ from src.predict.mysql_store import (
 )
 from src.predict.stock_data_store import (
     list_db_stocks, load_stock_from_db, fetch_and_store, has_stock_data,
-    list_stocks_with_status, list_stock_sessions,
-)
-from src.predict.price_limits import (
-    detect_price_limit_pct, get_board_name, apply_price_limits,
+    list_stocks_with_status, list_stock_sessions, delete_stock_data,
 )
 from src.predict.fibonacci_wave import (
     detect_wave_levels, calculate_wave_fibonacci, generate_wave_fib_signals,
@@ -66,6 +63,42 @@ st.caption("支持 LSTM / GRU / 1D-CNN / CNN-GRU / PatchTST / TFT / XGBoost / Li
 
 config = load_config()
 predict_cfg = config.get("predict", {})
+
+
+def validate_target_variable(df: pd.DataFrame = None, silent: bool = False):
+    """校验日收益率是否为小数形式（非百分比）。
+
+    在启动时和数据加载后调用，防止回退到价格预测或百分比形式。
+    返回 (is_valid: bool, message: str)
+    """
+    # 检查默认模型参数中是否有价格相关配置残留
+    default_price_keys = ["predicted_close", "last_price", "returns_to_price"]
+    for key in default_price_keys:
+        if key in predict_cfg:
+            return False, f"配置中包含已废弃的价格字段 '{key}'，请清理"
+
+    # 检查数据中的日收益率范围
+    if df is not None and "日收益率" in df.columns:
+        returns = df["日收益率"].dropna()
+        if len(returns) > 0:
+            abs_mean = abs(returns).mean()
+            abs_max = abs(returns).max()
+
+            # 小数形式：均值约0.005-0.03，最大值<0.11（A股涨跌停限制）
+            if abs_mean > 1.0:
+                return False, (
+                    f"日收益率均值为 {abs_mean:.4f}，疑似百分比形式（应为小数）。"
+                    f"请检查 preprocessing.py 中是否误乘了 100。"
+                )
+            if abs_max > 0.15:
+                return False, (
+                    f"日收益率最大绝对值为 {abs_max:.4f}，超出A股涨跌停范围。"
+                    f"请检查数据是否存在异常值。"
+                )
+
+    if not silent:
+        print("[校验] 日收益率格式检查通过（小数形式）")
+    return True, "ok"
 
 
 def _serialize_results() -> bytes:
@@ -190,11 +223,11 @@ DEFAULT_MODEL_PARAMS = {
     "XGBoost": {"n_estimators": 100, "max_depth": 6, "learning_rate": 0.1, "subsample": 0.8},
     "LightGBM": {"n_estimators": 100, "max_depth": 6, "learning_rate": 0.1, "num_leaves": 31, "subsample": 0.8},
     "1D-CNN": {"look_back": 30, "filters": 32, "kernel_size": 3, "dropout": 0.2, "learning_rate": 0.001},
-    "CNN-GRU": {"cnn_filters": 32, "kernel_size": 3, "gru_units": 24, "dropout": 0.2, "learning_rate": 0.0006},
+    "CNN-GRU": {"cnn_filters": 32, "kernel_size": 3, "gru_units": 24, "dropout": 0.2, "look_back": 30, "learning_rate": 0.0006},
     "GRU": {"units": 32, "look_back": 30, "dropout": 0.2, "learning_rate": 0.001},
     "LSTM": {"units": 32, "look_back": 30, "dropout": 0.2, "learning_rate": 0.001},
-    "PatchTST": {"d_model": 128, "n_heads": 4, "n_layers": 2, "patch_size": 16, "dropout": 0.1},
-    "TFT": {"hidden_size": 64, "n_heads": 4, "dropout": 0.2, "lstm_layers": 1},
+    "PatchTST": {"d_model": 128, "n_heads": 4, "n_layers": 2, "patch_size": 16, "dropout": 0.1, "look_back": 30, "learning_rate": 0.001},
+    "TFT": {"hidden_size": 64, "n_heads": 4, "dropout": 0.2, "lstm_layers": 1, "look_back": 30, "learning_rate": 0.001},
     "ARIMA": {"auto": True, "p": 1, "d": 1, "q": 1},
     "SARIMA": {"p": 1, "d": 1, "q": 1, "P": 1, "D": 1, "Q": 1, "s": 5},
     "GARCH": {"p": 1, "q": 1, "dist": "t"},
@@ -323,7 +356,7 @@ def lightgbm_dialog():
 def cnn_dialog():
     params = st.session_state.model_params["1D-CNN"]
     defaults = DEFAULT_MODEL_PARAMS["1D-CNN"]
-    new_lb = st.slider("时间步长", 10, 40, params["look_back"], 5, key="dg_cnn_lb")
+    new_lb = st.slider("时间步长", 1, 60, params["look_back"], key="dg_cnn_lb")
     new_fl = st.slider("卷积核", 16, 64, params["filters"], 8, key="dg_cnn_fl")
     new_ks = st.slider("核大小", 2, 5, params["kernel_size"], 1, key="dg_cnn_ks")
     new_do = st.slider("Dropout", 0.1, 0.4, params["dropout"], 0.05, key="dg_cnn_do")
@@ -348,6 +381,7 @@ def cnn_gru_dialog():
     new_cf = st.slider("卷积核", 16, 64, params["cnn_filters"], 8, key="dg_cg_cf")
     new_ks = st.slider("核大小", 2, 5, params["kernel_size"], 1, key="dg_cg_ks")
     new_gu = st.slider("GRU单元", 16, 64, params["gru_units"], 8, key="dg_cg_gu")
+    new_lb = st.slider("时间步长", 1, 60, params["look_back"], key="dg_cg_lb")
     new_do = st.slider("Dropout", 0.1, 0.4, params["dropout"], 0.05, key="dg_cg_do")
     new_lr = st.slider("学习率", 0.0001, 0.005, params["learning_rate"], 0.0001, format="%.4f", key="dg_cg_lr")
     c1, c2 = st.columns(2)
@@ -358,7 +392,8 @@ def cnn_gru_dialog():
     if c2.button("确认保存", use_container_width=True, type="primary"):
         st.session_state.model_params["CNN-GRU"] = {
             "cnn_filters": new_cf, "kernel_size": new_ks,
-            "gru_units": new_gu, "dropout": new_do, "learning_rate": new_lr}
+            "gru_units": new_gu, "look_back": new_lb,
+            "dropout": new_do, "learning_rate": new_lr}
         _param_changed("CNN-GRU", "cnn_filters", new_cf, defaults["cnn_filters"])
         st.rerun()
 
@@ -368,7 +403,7 @@ def gru_dialog():
     params = st.session_state.model_params["GRU"]
     defaults = DEFAULT_MODEL_PARAMS["GRU"]
     new_un = st.slider("神经元", 16, 64, params["units"], 8, key="dg_gru_un")
-    new_lb = st.slider("时间步长", 10, 40, params["look_back"], 5, key="dg_gru_lb")
+    new_lb = st.slider("时间步长", 1, 60, params["look_back"], key="dg_gru_lb")
     new_do = st.slider("Dropout", 0.1, 0.4, params["dropout"], 0.05, key="dg_gru_do")
     new_lr = st.slider("学习率", 0.0001, 0.005, params["learning_rate"], 0.0001, format="%.4f", key="dg_gru_lr")
     c1, c2 = st.columns(2)
@@ -389,7 +424,7 @@ def lstm_dialog():
     params = st.session_state.model_params["LSTM"]
     defaults = DEFAULT_MODEL_PARAMS["LSTM"]
     new_un = st.slider("神经元", 16, 64, params["units"], 8, key="dg_lstm_un")
-    new_lb = st.slider("时间步长", 10, 40, params["look_back"], 5, key="dg_lstm_lb")
+    new_lb = st.slider("时间步长", 1, 60, params["look_back"], key="dg_lstm_lb")
     new_do = st.slider("Dropout", 0.1, 0.4, params["dropout"], 0.05, key="dg_lstm_do")
     new_lr = st.slider("学习率", 0.0001, 0.005, params["learning_rate"], 0.0001, format="%.4f", key="dg_lstm_lr")
     c1, c2 = st.columns(2)
@@ -416,7 +451,9 @@ def patchtst_dialog():
     new_nl = st.slider("编码器层数", 1, 4, params["n_layers"], 1, key="dg_pt_nl")
     new_ps = st.select_slider("Patch大小", [8, 16, 32],
                               value=params["patch_size"], key="dg_pt_ps")
+    new_lb = st.slider("时间步长", 1, 60, params["look_back"], key="dg_pt_lb")
     new_do = st.slider("Dropout", 0.05, 0.3, params["dropout"], 0.05, key="dg_pt_do")
+    new_lr = st.slider("学习率", 0.0001, 0.005, params["learning_rate"], 0.0001, format="%.4f", key="dg_pt_lr")
     c1, c2 = st.columns(2)
     if c1.button("恢复默认", use_container_width=True):
         st.session_state.model_params["PatchTST"] = dict(defaults)
@@ -425,7 +462,8 @@ def patchtst_dialog():
     if c2.button("确认保存", use_container_width=True, type="primary"):
         st.session_state.model_params["PatchTST"] = {
             "d_model": new_dm, "n_heads": new_nh, "n_layers": new_nl,
-            "patch_size": new_ps, "dropout": new_do}
+            "patch_size": new_ps, "look_back": new_lb,
+            "dropout": new_do, "learning_rate": new_lr}
         _param_changed("PatchTST", "d_model", new_dm, defaults["d_model"])
         st.rerun()
 
@@ -440,6 +478,8 @@ def tft_dialog():
                               value=params["n_heads"], key="dg_tft_nh")
     new_do = st.slider("Dropout", 0.1, 0.4, params["dropout"], 0.05, key="dg_tft_do")
     new_nl = st.slider("LSTM层数", 1, 3, params["lstm_layers"], 1, key="dg_tft_nl")
+    new_lb = st.slider("时间步长", 1, 60, params["look_back"], key="dg_tft_lb")
+    new_lr = st.slider("学习率", 0.0001, 0.005, params["learning_rate"], 0.0001, format="%.4f", key="dg_tft_lr")
     c1, c2 = st.columns(2)
     if c1.button("恢复默认", use_container_width=True):
         st.session_state.model_params["TFT"] = dict(defaults)
@@ -448,7 +488,8 @@ def tft_dialog():
     if c2.button("确认保存", use_container_width=True, type="primary"):
         st.session_state.model_params["TFT"] = {
             "hidden_size": new_hs, "n_heads": new_nh,
-            "dropout": new_do, "lstm_layers": new_nl}
+            "dropout": new_do, "lstm_layers": new_nl,
+            "look_back": new_lb, "learning_rate": new_lr}
         _param_changed("TFT", "hidden_size", new_hs, defaults["hidden_size"])
         st.rerun()
 
@@ -631,19 +672,25 @@ with st.sidebar:
         st.divider()
         st.caption("添加新股")
         new_code = st.text_input("股票代码", key="new_stock_code", placeholder="6位代码")
+        full_history = st.checkbox("全量历史数据（从上市首日，适合需要大样本的模型）", key="full_history")
         if new_code and len(new_code) == 6:
             exists = False
             try:
                 exists = has_stock_data(new_code) or any(s["code"] == new_code for s in st.session_state.db_stocks)
             except Exception:
                 pass
-            if exists:
-                st.info("该股票数据已存在，刷新列表即可看到")
+            if exists and not full_history:
+                st.info("该股票数据已存在，刷新列表即可看到。如需全量数据请勾选「全量历史数据」")
             else:
-                if st.button("获取数据", type="primary", use_container_width=True, key="fetch_new_btn"):
-                    with st.spinner(f"正在获取 {new_code} 数据..."):
+                btn_label = "重新获取全量数据" if (exists and full_history) else "获取数据"
+                if st.button(btn_label, type="primary", use_container_width=True, key="fetch_new_btn"):
+                    with st.spinner(f"正在获取 {new_code} {'全量' if full_history else ''}数据..."):
                         try:
-                            df, name, _ = fetch_and_store(new_code)
+                            start_d = "19900101" if full_history else "20200101"
+                            max_d = 10000 if full_history else 500
+                            if exists and full_history:
+                                delete_stock_data(new_code)
+                            df, name, _ = fetch_and_store(new_code, start_date=start_d, max_days=max_d)
                             st.session_state.stock_data = df
                             st.session_state.stock_code = new_code
                             st.session_state.stock_name = name
@@ -712,7 +759,7 @@ with st.sidebar:
     # 通用训练参数
     st.subheader("训练参数")
     forecast_days = st.slider("预测天数", 1, 10, 5)
-    look_back = st.slider("时间步长(天)", 10, 60, predict_cfg.get("default_look_back", 30))
+    look_back = st.slider("时间步长(天)", 1, 60, predict_cfg.get("default_look_back", 30))
 
     quick_mode = st.toggle("快速模式", value=False, help="减少训练轮次和模型参数，适合快速测试")
 
@@ -825,21 +872,22 @@ def _build_config():
     arima_p = mp["ARIMA"]
     garch_p = mp["GARCH"]
 
-    # dropout 和 learning_rate：从第一个选中的DL模型获取，或使用默认值
+    # dropout：从第一个选中的DL模型获取，或使用默认值
     dropout = dl_cfg.get("dropout", 0.2)
-    learning_rate = DL_LEARNING_RATE
     dl_selected = [m for m in selected_models if m in ("LSTM", "GRU", "1D-CNN", "CNN-GRU", "PatchTST", "TFT")]
     if dl_selected:
         first_dl = dl_selected[0]
         dl_params = mp.get(first_dl, {})
         dropout = dl_params.get("dropout", dropout)
-        learning_rate = dl_params.get("learning_rate", learning_rate)
+
+    def _get_lr(model_name):
+        return mp.get(model_name, {}).get("learning_rate", DL_LEARNING_RATE)
 
     return ModelConfig(
         look_back=look_back,
         epochs=epochs,
         batch_size=batch_size,
-        learning_rate=learning_rate,
+        learning_rate=DL_LEARNING_RATE,
         dropout=dropout,
         lstm_units=units_lstm,
         gru_units=units_gru,
@@ -859,6 +907,13 @@ def _build_config():
         tft_n_heads=tft_n_heads_val,
         tft_dropout=mp.get("TFT", {}).get("dropout", tf_cfg.get("dropout", 0.2)),
         tft_lstm_layers=mp.get("TFT", {}).get("lstm_layers", tf_cfg.get("lstm_layers", 1)),
+        # Per-model DL learning rates
+        lstm_lr=_get_lr("LSTM"),
+        gru_lr=_get_lr("GRU"),
+        cnn_lr=_get_lr("1D-CNN"),
+        cnn_gru_lr=_get_lr("CNN-GRU"),
+        patchtst_lr=_get_lr("PatchTST"),
+        tft_lr=_get_lr("TFT"),
         xgboost_n_estimators=xgb_n_estimators,
         xgboost_max_depth=xgb_max_depth,
         xgboost_learning_rate=xgb_lr,
@@ -1129,27 +1184,14 @@ if btn_train and st.session_state.stock_data is not None:
         preds = None
         if use_ensemble and len(results) > 1:
             weights = compute_ensemble_weights(results)
-            last_price = st.session_state.stock_data["close"].iloc[-1]
-            preds = ensemble_predict(results, weights, forecast_days, last_price)
+            preds = ensemble_predict(results, weights, forecast_days)
             st.session_state.ensemble_weights = weights
             st.session_state.predictions = preds
         elif results:
             weights = {list(results.keys())[0]: 1.0}
             st.session_state.ensemble_weights = weights
-            last_price = st.session_state.stock_data["close"].iloc[-1]
-            preds = ensemble_predict(results, weights, forecast_days, last_price)
+            preds = ensemble_predict(results, weights, forecast_days)
             st.session_state.predictions = preds
-
-        # 应用A股涨跌停限制
-        if preds and last_price:
-            stock_code = st.session_state.get("stock_code", "")
-            stock_name = st.session_state.get("stock_name", "")
-            limit_pct = detect_price_limit_pct(stock_code, stock_name)
-            if limit_pct is not None:
-                preds = apply_price_limits(preds, last_price, limit_pct)
-                st.session_state.predictions = preds
-                st.session_state["_price_limit_pct"] = limit_pct
-                st.session_state["_board_name"] = get_board_name(stock_code)
 
         # 保存模型
         for name, result in results.items():
@@ -1467,15 +1509,15 @@ with tab2:
 # ── Tab 3: 预测结果 ──────────────────────────────────────────
 
 with tab3:
-    if st.session_state.predictions and st.session_state.predictions.get("predicted_close") is not None \
-       and len(st.session_state.predictions["predicted_close"]) > 0:
+    if st.session_state.predictions and st.session_state.predictions.get("predicted_return") is not None \
+       and len(st.session_state.predictions["predicted_return"]) > 0:
         preds = st.session_state.predictions
 
         if st.session_state.stock_data is not None:
             last_price = st.session_state.stock_data["close"].iloc[-1]
             last_date = st.session_state.stock_data.index[-1]
         else:
-            last_price = preds["predicted_close"][0] / (1 + preds["daily_return"][0] / 100) if preds["daily_return"][0] != 0 else preds["predicted_close"][0]
+            last_price = 10.0
             last_date = pd.Timestamp.now()
 
         # 生成未来交易日日期
@@ -1485,26 +1527,26 @@ with tab3:
         st.subheader("未来预测结果")
         pred_table = pd.DataFrame({
             "日期": future_dates.strftime("%Y-%m-%d"),
-            "预测收盘价": [f"¥{p:.2f}" for p in preds["predicted_close"]],
-            "日收益率(%)": [f"{r:+.2f}" for r in preds["daily_return"]],
-            "累计收益率(%)": [f"{r:+.2f}" for r in preds["cumulative_return"]],
+            "预测日收益率": [f"{r*100:+.2f}%" for r in preds["predicted_return"]],
+            "日收益率": [f"{r*100:+.2f}%" for r in preds["daily_return"]],
+            "累计收益率": [f"{r*100:+.2f}%" for r in preds["cumulative_return"]],
         })
         st.dataframe(pred_table, use_container_width=True, hide_index=True)
 
         # 关键指标
         c1, c2, c3 = st.columns(3)
         total_ret = preds["cumulative_return"][-1]
-        c1.metric("预测总收益", f"{total_ret:+.2f}%",
+        c1.metric("预测累计收益", f"{total_ret*100:+.2f}%",
                   delta="看涨" if total_ret > 0 else "看跌")
-        c2.metric("最高预测价", f"¥{max(preds['predicted_close']):.2f}")
-        c3.metric("最低预测价", f"¥{min(preds['predicted_close']):.2f}")
+        c2.metric("最高日收益率", f"{max(preds['predicted_return'])*100:+.2f}%")
+        c3.metric("最低日收益率", f"{min(preds['predicted_return'])*100:+.2f}%")
 
         # 收益率柱状图
         fig_ret = go.Figure()
         colors = ["red" if r > 0 else "green" for r in preds["daily_return"]]
         fig_ret.add_trace(go.Bar(
             x=future_dates.strftime("%m-%d"),
-            y=preds["daily_return"],
+            y=preds["daily_return"] * 100,
             marker_color=colors,
             name="日收益率",
         ))
@@ -1512,68 +1554,28 @@ with tab3:
                               xaxis_title="日期", yaxis_title="收益率(%)")
         st.plotly_chart(fig_ret, use_container_width=True)
 
-        # 价格走势图（含置信区间）
-        if st.session_state.stock_data is not None:
-            hist_close = st.session_state.stock_data["close"].tail(60)
-        else:
-            hist_close = pd.Series(dtype=float)
-        fig_price = go.Figure()
+        # 累计收益率走势图（含置信区间）
+        fig_cum = go.Figure()
 
-        # 历史
-        if not hist_close.empty:
-            fig_price.add_trace(go.Scatter(
-                x=hist_close.index, y=hist_close.values,
-                name="历史收盘价", line=dict(color="#1f77b4")))
-
-        # 预测
-        fig_price.add_trace(go.Scatter(
-            x=future_dates, y=preds["predicted_close"],
-            name="集成预测", line=dict(color="red", width=2, dash="dot"),
+        # 预测累计收益率
+        fig_cum.add_trace(go.Scatter(
+            x=future_dates, y=preds["cumulative_return"] * 100,
+            name="预测累计收益率", line=dict(color="red", width=2),
             mode="lines+markers"))
 
-        # 置信区间
+        # 置信区间（转为累计收益率，近似：(1+r_lower)累积-1）
         if "confidence_lower" in preds and len(preds["confidence_lower"]) > 0:
-            fig_price.add_trace(go.Scatter(
+            conf_lower_cum = np.cumprod(1 + preds["confidence_lower"]) - 1
+            conf_upper_cum = np.cumprod(1 + preds["confidence_upper"]) - 1
+            fig_cum.add_trace(go.Scatter(
                 x=list(future_dates) + list(future_dates[::-1]),
-                y=list(preds["confidence_upper"]) + list(preds["confidence_lower"][::-1]),
+                y=list(conf_upper_cum * 100) + list(conf_lower_cum * 100)[::-1],
                 fill="toself", fillcolor="rgba(255,0,0,0.1)",
-                line=dict(color="rgba(255,0,0,0)"), name="95%置信区间"))
+                line=dict(color="rgba(255,0,0,0)"), name="置信区间"))
 
-        # 涨跌停限制线
-        limit_pct_display = st.session_state.get("_price_limit_pct")
-        if limit_pct_display is not None:
-            board = st.session_state.get("_board_name", "")
-            upper_limit = last_price * (1 + limit_pct_display)
-            lower_limit = last_price * (1 - limit_pct_display)
-            fig_price.add_hline(y=upper_limit, line_dash="dash", line_color="purple",
-                                annotation_text=f"涨停(+{limit_pct_display*100:.0f}%)",
-                                annotation_position="top right")
-            fig_price.add_hline(y=lower_limit, line_dash="dash", line_color="purple",
-                                annotation_text=f"跌停(-{limit_pct_display*100:.0f}%)",
-                                annotation_position="bottom right")
-
-        # 波段斐波那契水平线
-        if st.session_state.stock_data is not None:
-            wave_info = detect_wave_levels(st.session_state.stock_data)
-            fib_levels = calculate_wave_fibonacci(wave_info)
-            for level_info in fib_levels:
-                line_width = 2.5 if "黄金" in level_info.get("type", "") else 1.0
-                fig_price.add_hline(y=level_info["price"], line_dash="dash",
-                    line_color=level_info["color"], opacity=0.5,
-                    annotation_text=f"{level_info['name']} ({level_info['price']:.1f})",
-                    annotation_position="left",
-                    line_width=line_width)
-
-        fig_price.update_layout(height=500, title="收盘价预测走势（含置信区间）",
-                                xaxis_title="日期", yaxis_title="价格(¥)")
-        st.plotly_chart(fig_price, use_container_width=True)
-
-        # 涨跌停信息
-        if limit_pct_display is not None:
-            board = st.session_state.get("_board_name", "")
-            upper_limit = last_price * (1 + limit_pct_display)
-            lower_limit = last_price * (1 - limit_pct_display)
-            st.info(f"板块: **{board}** | 涨跌停限制: ±**{limit_pct_display*100:.0f}%** | 涨停价: ¥{upper_limit:.2f} | 跌停价: ¥{lower_limit:.2f}")
+        fig_cum.update_layout(height=500, title="累计收益率预测走势",
+                              xaxis_title="日期", yaxis_title="累计收益率(%)")
+        st.plotly_chart(fig_cum, use_container_width=True)
 
         # 波段斐波那契交易信号
         if st.session_state.stock_data is not None:
@@ -1632,14 +1634,14 @@ with tab3:
             fig_cmp = go.Figure()
             for name, vals in preds["model_predictions"].items():
                 fig_cmp.add_trace(go.Scatter(
-                    x=future_dates, y=vals,
+                    x=future_dates, y=vals * 100,
                     name=name, mode="lines+markers"))
-            if len(preds["predicted_close"]) > 0:
+            if len(preds["predicted_return"]) > 0:
                 fig_cmp.add_trace(go.Scatter(
-                    x=future_dates, y=preds["predicted_close"],
+                    x=future_dates, y=preds["predicted_return"] * 100,
                     name="集成", line=dict(width=3, dash="dash"), mode="lines"))
-            fig_cmp.update_layout(height=400, title="各模型预测价格对比",
-                                  xaxis_title="日期", yaxis_title="价格(¥)")
+            fig_cmp.update_layout(height=400, title="各模型日收益率预测对比",
+                                  xaxis_title="日期", yaxis_title="收益率(%)")
             st.plotly_chart(fig_cmp, use_container_width=True)
 
         # 中长期预测联动
@@ -1682,9 +1684,9 @@ with tab4:
             test_dates = df_full.index[-n_test:] if df_full is not None and len(df_full) >= n_test else list(range(n_test))
 
             fig_vs = go.Figure()
-            fig_vs.add_trace(go.Scatter(x=test_dates, y=r.test_returns_actual,
+            fig_vs.add_trace(go.Scatter(x=test_dates, y=r.test_returns_actual * 100,
                                         name="实际值", line=dict(color="blue")))
-            fig_vs.add_trace(go.Scatter(x=test_dates, y=r.test_returns,
+            fig_vs.add_trace(go.Scatter(x=test_dates, y=r.test_returns * 100,
                                         name="预测值", line=dict(color="red", dash="dash")))
             fig_vs.update_layout(height=400, title=f"{model_sel} - 测试集预测效果",
                                  xaxis_title="日期", yaxis_title="收益率(%)")
@@ -1759,10 +1761,9 @@ with tab5:
                         st.session_state.train_results = new_results
                         if use_ensemble and len(new_results) > 1:
                             w = compute_ensemble_weights(new_results)
-                            last_p = st.session_state.stock_data["close"].iloc[-1]
                             st.session_state.ensemble_weights = w
                             st.session_state.predictions = ensemble_predict(
-                                new_results, w, forecast_days, last_p)
+                                new_results, w, forecast_days)
                     st.success("模型更新完成!")
                     st.rerun()
                 else:
@@ -1865,19 +1866,19 @@ with tab6:
                 st.session_state.stock_data.to_excel(writer, sheet_name="原始数据")
 
             # 预测结果
-            if st.session_state.predictions and len(st.session_state.predictions.get("predicted_close", [])) > 0:
+            if st.session_state.predictions and len(st.session_state.predictions.get("predicted_return", [])) > 0:
                 preds = st.session_state.predictions
                 if st.session_state.stock_data is not None:
                     last_date = st.session_state.stock_data.index[-1]
                 else:
                     last_date = pd.Timestamp.now()
                 future_dates = pd.bdate_range(start=last_date + timedelta(days=1),
-                                              periods=len(preds["predicted_close"]))
+                                              periods=len(preds["predicted_return"]))
                 pred_df = pd.DataFrame({
                     "日期": future_dates,
-                    "预测收盘价": preds["predicted_close"],
-                    "日收益率(%)": preds["daily_return"],
-                    "累计收益率(%)": preds["cumulative_return"],
+                    "预测日收益率": preds["predicted_return"],
+                    "日收益率": preds["daily_return"],
+                    "累计收益率": preds["cumulative_return"],
                 })
                 pred_df.to_excel(writer, sheet_name="预测结果", index=False)
 

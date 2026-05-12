@@ -25,11 +25,10 @@ def preprocess_data(df: pd.DataFrame, return_clip: float = 0.10) -> pd.DataFrame
     if 'pct_change' in df.columns:
         df['日收益率'] = df['pct_change']
     else:
-        df['日收益率'] = df['close'].pct_change() * 100
+        df['日收益率'] = df['close'].pct_change()  # 小数形式，如 0.015 = 1.5%
 
     # 截断 ±10%（符合A股涨跌幅限制）
-    clip_val = return_clip * 100
-    df['日收益率'] = df['日收益率'].clip(-clip_val, clip_val)
+    df['日收益率'] = df['日收益率'].clip(-return_clip, return_clip)
 
     # ── 2. 涨跌标签 ──────────────────────────────
     df['涨跌标签'] = (df['日收益率'] > 0).astype(int)
@@ -40,7 +39,7 @@ def preprocess_data(df: pd.DataFrame, return_clip: float = 0.10) -> pd.DataFrame
 
     # ── 4. 成交量衍生特征 ─────────────────────────
     # 成交量变化率
-    df['成交量变化率'] = df['volume'].pct_change() * 100
+    df['成交量变化率'] = df['volume'].pct_change()
 
     # 相对成交量（与20日均值比）
     vol_ma20 = df['volume'].rolling(window=20).mean().replace(0, np.nan)

@@ -104,6 +104,17 @@ def _trim_stock_data(stock_code: str, keep_days: int):
     conn.close()
 
 
+def delete_stock_data(stock_code: str):
+    """删除某股票的全部数据（用于重新获取全量数据）"""
+    conn = _get_conn()
+    if not conn:
+        return
+    cur = conn.cursor()
+    cur.execute("DELETE FROM stock_daily_data WHERE stock_code=%s", (stock_code,))
+    cur.close()
+    conn.close()
+
+
 def _safe_float(v):
     if v is None:
         return None
@@ -156,7 +167,7 @@ def list_db_stocks() -> list:
     cols = [d[0] for d in cur.description]
     rows = [dict(zip(cols, r)) for r in cur.fetchall()]
     for r in rows:
-        r["rows"] = min(r.pop("data_rows"), 500)
+        r["rows"] = r.pop("data_rows")
     for r in rows:
         r["code"] = r["stock_code"]
         r["name"] = r["stock_name"]
