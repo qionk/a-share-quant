@@ -174,7 +174,7 @@ def save_training_results(stock_code, stock_name, results, ensemble_weights,
         _json_dumps(ensemble_weights),
         _json_dumps(preds_json),
         _json_dumps(config_summary),
-        float(predictions["predicted_close"][0]) if predictions else None,
+        float(predictions["predicted_return"][0]) if predictions else None,
         _json_dumps(_serialize_stock_data(stock_data)),
     ))
 

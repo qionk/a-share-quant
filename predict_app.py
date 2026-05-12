@@ -1820,8 +1820,15 @@ with tab5:
                         "n_features": cfg.n_features,
                         "epochs": cfg.epochs,
                         "batch_size": cfg.batch_size,
-                        "learning_rate": cfg.learning_rate,
                         "dropout": cfg.dropout,
+                        "lstm_lr": cfg.lstm_lr,
+                        "gru_lr": cfg.gru_lr,
+                        "cnn_lr": cfg.cnn_lr,
+                        "cnn_gru_lr": cfg.cnn_gru_lr,
+                        "patchtst_lr": cfg.patchtst_lr,
+                        "tft_lr": cfg.tft_lr,
+                        "xgboost_lr": cfg.xgboost_learning_rate,
+                        "lightgbm_lr": cfg.lightgbm_learning_rate,
                         "lstm_units": cfg.lstm_units,
                         "gru_units": cfg.gru_units,
                         "cnn_filters": cfg.cnn_filters,
@@ -1957,8 +1964,24 @@ with tab7:
         st.markdown(f"- 时间步长: **{last_config.look_back}** 天")
         st.markdown(f"- 训练轮次: **{last_config.epochs}**")
         st.markdown(f"- 批量大小: **{last_config.batch_size}**")
-        st.markdown(f"- 学习率: **{last_config.learning_rate:.6f}**")
         st.markdown(f"- Dropout: **{last_config.dropout}**")
+
+        # 显示各DL模型独立学习率
+        dl_lr_map = {
+            "LSTM": last_config.lstm_lr, "GRU": last_config.gru_lr,
+            "1D-CNN": last_config.cnn_lr, "CNN-GRU": last_config.cnn_gru_lr,
+            "PatchTST": last_config.patchtst_lr, "TFT": last_config.tft_lr,
+        }
+        st.markdown("- DL学习率: " + " | ".join(
+            f"**{name}**: {lr:.4f}" for name, lr in dl_lr_map.items()
+        ))
+        tree_lrs = []
+        if hasattr(last_config, 'xgboost_learning_rate'):
+            tree_lrs.append(f"XGBoost: {last_config.xgboost_learning_rate:.2f}")
+        if hasattr(last_config, 'lightgbm_learning_rate'):
+            tree_lrs.append(f"LightGBM: {last_config.lightgbm_learning_rate:.2f}")
+        if tree_lrs:
+            st.markdown("- 树模型学习率: " + " | ".join(tree_lrs))
 
     if st.session_state.train_results:
         st.markdown("---")

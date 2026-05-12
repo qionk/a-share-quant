@@ -199,7 +199,7 @@ def build_cnn_gru(config: ModelConfig):
 
 def build_patchtst(config: ModelConfig):
     """
-    PatchTST: Patch + Transformer Encoder + Linear Head
+    PatchTST + RevIN: per-instance z-score → Patch → Transformer → inverse
     """
     _set_seed()
     import tensorflow as tf
@@ -222,7 +222,18 @@ def build_patchtst(config: ModelConfig):
 
     inputs = layers.Input(shape=(look_back, n_features))
 
-    x = inputs
+    # ── RevIN normalize: (x - mean) / std ──
+    eps = 1e-5
+    x_mean = layers.Lambda(lambda t: tf.reduce_mean(t, axis=1, keepdims=True))(inputs)
+    x_std = layers.Lambda(lambda t: tf.math.reduce_std(t, axis=1, keepdims=True) + 1e-5)(inputs)
+    x_norm = layers.Subtract()([inputs, x_mean])
+    x_norm = layers.Lambda(lambda t: t[0] / t[1])([x_norm, x_std])
+
+    # Save target feature stats for inverse (reshape to (None,1) for broadcasting)
+    target_mean = layers.Lambda(lambda t: t[:, 0, 0:1])(x_mean)
+    target_std = layers.Lambda(lambda t: t[:, 0, 0:1])(x_std)
+
+    x = x_norm
     if pad_len > 0:
         x = layers.ZeroPadding1D(padding=(pad_len, 0))(x)
 
@@ -249,7 +260,11 @@ def build_patchtst(config: ModelConfig):
     x = layers.Flatten()(x)
     x = layers.Dense(64, activation="relu")(x)
     x = layers.Dropout(drop)(x)
-    outputs = layers.Dense(1)(x)
+    x = layers.Dense(1)(x)
+
+    # ── RevIN inverse: x * std + mean ──
+    outputs = layers.Multiply()([x, target_std])
+    outputs = layers.Add()([outputs, target_mean])
 
     model = Model(inputs=inputs, outputs=outputs, name="PatchTST")
     model.compile(
