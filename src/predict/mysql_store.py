@@ -182,8 +182,9 @@ def save_training_results(stock_code, stock_name, results, ensemble_weights,
         INSERT INTO model_results
         (id, session_id, model_name, cv_metrics, training_time,
          future_predictions, future_conf_lower, future_conf_upper,
-         test_predictions, test_actuals, confidence_lower, confidence_upper)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+         test_predictions, test_actuals, test_returns, test_returns_actual,
+         confidence_lower, confidence_upper)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     """
     for name, r in results.items():
         cur.execute(model_sql, (
@@ -195,6 +196,8 @@ def save_training_results(stock_code, stock_name, results, ensemble_weights,
             _json_dumps(_sanitize(r.future_conf_upper)),
             _json_dumps(_sanitize(r.test_predictions)),
             _json_dumps(_sanitize(r.test_actuals)),
+            _json_dumps(_sanitize(r.test_returns)),
+            _json_dumps(_sanitize(r.test_returns_actual)),
             _json_dumps(_sanitize(r.confidence_lower)),
             _json_dumps(_sanitize(r.confidence_upper)),
         ))
@@ -303,6 +306,8 @@ def restore_to_session_state(session_row, model_rows):
         tr.future_conf_upper = np.array(_json_loads(mr.get("future_conf_upper")) or [])
         tr.test_predictions = np.array(_json_loads(mr.get("test_predictions")) or [])
         tr.test_actuals = np.array(_json_loads(mr.get("test_actuals")) or [])
+        tr.test_returns = np.array(_json_loads(mr.get("test_returns")) or [])
+        tr.test_returns_actual = np.array(_json_loads(mr.get("test_returns_actual")) or [])
         tr.confidence_lower = np.array(_json_loads(mr.get("confidence_lower")) or [])
         tr.confidence_upper = np.array(_json_loads(mr.get("confidence_upper")) or [])
         tr.train_history = {}

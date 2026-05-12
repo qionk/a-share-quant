@@ -26,6 +26,8 @@ CREATE TABLE model_results (
     future_conf_upper JSON,
     test_predictions JSON,
     test_actuals JSON,
+    test_returns JSON,
+    test_returns_actual JSON,
     confidence_lower JSON,
     confidence_upper JSON,
     FOREIGN KEY (session_id) REFERENCES training_sessions(id) ON DELETE CASCADE
