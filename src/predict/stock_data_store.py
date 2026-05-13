@@ -301,7 +301,7 @@ def fetch_and_store(stock_code: str, start_date: str = "20200101",
                 # 跳出 if 块，走下面的全量获取
             else:
                 # 已有数据在请求范围内，仅增量更新
-                if last_date < today - pd.Timedelta(days=1):
+                if last_date < today:
                     if progress_callback:
                         progress_callback("updating")
                     from src.predict.data_input import load_from_akshare

@@ -646,8 +646,8 @@ def clf_elasticnet_dialog():
     params = st.session_state.clf_params["ElasticNet"]
     defaults = {"C": 1.0, "l1_ratio": 0.5, "max_iter": 5000, "tol": 1e-3}
 
-    new_C = st.slider("正则化强度 C (越小越强)", 0.001, 100.0, params.get("C", 1.0), 0.001,
-                      key="dg_clf_en_c", format="%.3f")
+    new_C = st.slider("正则化强度 C (越小越强)", 0.0, 2.0, params.get("C", 1.0), 0.01,
+                      key="dg_clf_en_c", format="%.2f")
     new_l1 = st.slider("L1比例 l1_ratio", 0.0, 1.0, params.get("l1_ratio", 0.5), 0.01,
                        key="dg_clf_en_l1", format="%.2f")
     new_mi = st.slider("最大迭代次数 max_iter", 500, 20000, params.get("max_iter", 5000), 500,
@@ -687,15 +687,16 @@ with st.sidebar:
     data_source = st.radio("数据来源", ["数据库加载", "Excel上传"], horizontal=True)
 
     if data_source == "数据库加载":
-        # 日期区间选择
+        # 日期区间选择（max_value 设为明天，确保今天可选）
+        _tomorrow = date.today() + __import__('datetime').timedelta(days=1)
         col_d1, col_d2 = st.columns(2)
         with col_d1:
             custom_start = st.date_input("起始日期", value=date(2020, 1, 1),
-                                         min_value=date(1990, 1, 1), max_value=date.today(),
+                                         min_value=date(1990, 1, 1), max_value=_tomorrow,
                                          key="custom_start_date")
         with col_d2:
             custom_end = st.date_input("结束日期", value=date.today(),
-                                       min_value=date(1990, 1, 1), max_value=date.today(),
+                                       min_value=date(1990, 1, 1), max_value=_tomorrow,
                                        key="custom_end_date")
         start_d = custom_start.strftime("%Y%m%d")
         end_d = custom_end.strftime("%Y%m%d")
@@ -1490,6 +1491,29 @@ if btn_clf_train and st.session_state.stock_data is not None:
 
         st.session_state.clf_results = results
         st.session_state.clf_ensemble_result = ensemble_result
+
+        # 保存到历史库
+        try:
+            from src.predict.clf_history_store import save_clf_session
+            session_id = save_clf_session(
+                stock_code, stock_name,
+                {
+                    "forecast_days": st.session_state.clf_forecast_days,
+                    "threshold": st.session_state.clf_threshold,
+                    "look_back": st.session_state.clf_look_back,
+                    "n_splits": st.session_state.clf_n_splits,
+                    "selected_models": st.session_state.clf_selected_models,
+                    "params": st.session_state.clf_params,
+                    "results": results,
+                    "ensemble_result": ensemble_result,
+                    "data_dates": (stock_data.index[0], stock_data.index[-1]),
+                },
+            )
+            if session_id > 0:
+                st.toast(f"预测结果已保存 (Session #{session_id})")
+        except Exception as save_err:
+            st.warning(f"保存历史记录失败: {save_err}")
+
         clf_progress_bar.progress(1.0, text="涨跌预测训练完成!")
         st.toast("涨跌预测训练完成!")
 
@@ -2517,6 +2541,7 @@ with tab9:
                     ens["oos_returns"], ens["fused_signal"],
                     future_ret=ens["oos_future_ret"],
                     forecast_days=st.session_state.clf_forecast_days,
+                    next_day_ret=ens.get("oos_next_day_ret"),
                 )
 
         st.subheader("涨跌预测结果")
@@ -2586,21 +2611,19 @@ with tab9:
                         st.dataframe(pd.DataFrame(cv_rows), use_container_width=True, hide_index=True)
 
         # ── 累计收益曲线（使用 future_ret 作回测P&L） ──
-        st.subheader("样本外累计收益率")
-        st.caption(f"策略: T日收盘买入，T+{st.session_state.clf_forecast_days}日收盘卖出（未扣除交易费用）")
+        st.subheader("样本外策略日收益率")
+        st.caption("策略: T日收盘预测下一日涨则买入，T+1日收盘卖出。信号跌则空仓（未扣除交易费用）")
 
         fig_cum = go.Figure()
         first_model = st.session_state.clf_selected_models[0]
         if first_model in results:
             base_dates = results[first_model].oos_dates
             base_returns = results[first_model].oos_returns
-            base_future_ret = results[first_model].oos_future_ret
 
-            # 买入持有基准（使用 daily returns）
-            bh_cum = np.cumprod(1 + base_returns) - 1
+            # 买入持有基准（每日市场收益）
             fig_cum.add_trace(go.Scatter(
-                x=base_dates, y=bh_cum * 100,
-                name="买入持有（日收益）", line=dict(color="gray", dash="dash", width=1.5),
+                x=base_dates, y=base_returns * 100,
+                name="市场日收益", line=dict(color="gray", dash="dash", width=1.5),
                 mode="lines"))
 
             colors = {"XGBoost": "#1f77b4", "ElasticNet": "#ff7f0e", "Ensemble": "#2ca02c"}
@@ -2608,29 +2631,35 @@ with tab9:
                 if model_name not in results:
                     continue
                 r = results[model_name]
-                pnl = r.oos_future_ret if r.oos_future_ret is not None and len(r.oos_future_ret) > 0 else r.oos_returns
+                # 策略P&L: 下一日收益 × 信号（T日买→T+1日卖）
+                pnl = r.oos_next_day_ret if hasattr(r, 'oos_next_day_ret') and r.oos_next_day_ret is not None and len(r.oos_next_day_ret) > 0 else r.oos_returns
                 strategy_ret = pnl * r.oos_predictions
-                strategy_cum = np.cumprod(1 + strategy_ret) - 1
+                # 过滤 NaN
+                valid = ~np.isnan(strategy_ret)
+                plot_dates = r.oos_dates[valid] if valid.sum() > 0 else r.oos_dates
+                plot_ret = strategy_ret[valid] * 100 if valid.sum() > 0 else strategy_ret * 100
 
                 fig_cum.add_trace(go.Scatter(
-                    x=r.oos_dates, y=strategy_cum * 100,
+                    x=plot_dates, y=plot_ret,
                     name=f"{model_name}", mode="lines",
                     line=dict(color=colors.get(model_name, "#333"), width=2)))
 
             # 融合集成曲线
             if show_ensemble:
-                pnl_ens = ens["oos_future_ret"] if ens.get("oos_future_ret") is not None else ens["oos_returns"]
+                pnl_ens = ens.get("oos_next_day_ret") if ens.get("oos_next_day_ret") is not None else ens["oos_returns"]
                 strategy_ret_ens = pnl_ens * ens["fused_signal"]
-                strategy_cum_ens = np.cumprod(1 + strategy_ret_ens) - 1
+                valid_ens = ~np.isnan(strategy_ret_ens)
+                plot_dates_ens = ens["oos_dates"][valid_ens] if valid_ens.sum() > 0 else ens["oos_dates"]
+                plot_ret_ens = strategy_ret_ens[valid_ens] * 100 if valid_ens.sum() > 0 else strategy_ret_ens * 100
                 fig_cum.add_trace(go.Scatter(
-                    x=ens["oos_dates"], y=strategy_cum_ens * 100,
+                    x=plot_dates_ens, y=plot_ret_ens,
                     name="融合集成", mode="lines",
                     line=dict(color=colors["Ensemble"], width=3)))
 
         fig_cum.update_layout(
             height=450,
-            title=f"样本外累计收益率（T日收盘买/T+{st.session_state.clf_forecast_days}日收盘卖，未扣费）",
-            xaxis_title="日期", yaxis_title="累计收益率(%)",
+            title="样本外策略日收益率（T日收盘买入，T+1日收盘卖出，未扣费）",
+            xaxis_title="日期", yaxis_title="日收益率(%)",
             hovermode="x unified",
             legend=dict(orientation="h", yanchor="bottom", y=1.02),
             yaxis=dict(ticksuffix="%"),
@@ -2656,12 +2685,61 @@ with tab9:
 
         # ── 近期预测明细表 ──
         st.subheader("近期预测明细")
-        n_recent = st.slider("显示最近 N 天", 10, 60, 30, key="clf_recent_n")
-
         first_model = st.session_state.clf_selected_models[0]
         if first_model in results:
             base_dates_f = results[first_model].oos_dates
             base_future_ret_f = results[first_model].oos_future_ret
+
+        # ── 今日实时预测（基于最新交易日特征） ──
+        _has_latest = False
+        for _mn in st.session_state.clf_selected_models:
+            if _mn in results and not np.isnan(getattr(results[_mn], 'latest_proba', np.nan)):
+                _has_latest = True
+                break
+        if _has_latest:
+            # 融合概率
+            _latest_probas = []
+            for _mn in st.session_state.clf_selected_models:
+                if _mn in results and not np.isnan(getattr(results[_mn], 'latest_proba', np.nan)):
+                    _latest_probas.append(results[_mn].latest_proba)
+            _fused_latest = float(np.mean(_latest_probas)) if len(_latest_probas) > 1 else _latest_probas[0]
+            _latest_dir = "涨" if _fused_latest >= st.session_state.clf_threshold else "跌"
+            _latest_dt = None
+            for _mn in st.session_state.clf_selected_models:
+                if _mn in results and results[_mn].latest_date is not None:
+                    _latest_dt = results[_mn].latest_date
+                    break
+            _latest_dt_str = "?"
+            _predict_dt_str = "?"
+            if _latest_dt is not None:
+                _ts = pd.Timestamp(_latest_dt)
+                _latest_dt_str = _ts.strftime("%Y-%m-%d")
+                _next = _ts + pd.Timedelta(days=1)
+                while _next.weekday() >= 5:
+                    _next += pd.Timedelta(days=1)
+                _predict_dt_str = _next.strftime("%Y-%m-%d")
+            st.success(f"**基于 {_latest_dt_str} 收盘数据，预测 {_predict_dt_str} 上涨概率: {_fused_latest*100:.1f}%** (→ {_latest_dir})，实际结果待验证")
+
+        # 展示 OOS 最新预测（下一交易日上涨概率）
+        if first_model in results and len(base_dates_f) > 0:
+            latest_date = pd.Timestamp(base_dates_f[-1]).strftime("%Y-%m-%d") if len(base_dates_f) > 0 else "?"
+            if show_ensemble and len(ens["fused_proba"]) > 0:
+                latest_proba = ens["fused_proba"][-1]
+                latest_dir = "涨" if latest_proba >= st.session_state.clf_threshold else "跌"
+                latest_future = base_future_ret_f[-1]
+                if bool(np.isnan(latest_future)):
+                    st.info(f"**{latest_date} 下一交易日上涨概率: {latest_proba*100:.1f}%** (→ {latest_dir})，实际结果待验证")
+                else:
+                    actual = "✓ 正确" if (latest_proba >= st.session_state.clf_threshold) == (latest_future > 0) else "✗ 错误"
+                    st.info(f"**{latest_date} 下一交易日上涨概率: {latest_proba*100:.1f}%** (→ {latest_dir})，实际: {actual}")
+            elif first_model in results and len(results[first_model].oos_probabilities) > 0:
+                latest_proba = results[first_model].oos_probabilities[-1]
+                latest_dir = "涨" if latest_proba >= st.session_state.clf_threshold else "跌"
+                st.info(f"**{latest_date} 下一交易日上涨概率 ({first_model}): {latest_proba*100:.1f}%** (→ {latest_dir})")
+        n_recent = st.slider("显示最近 N 天", 10, 60, 30, key="clf_recent_n")
+
+        if first_model in results:
+            base_next_day_f = getattr(results[first_model], 'oos_next_day_ret', results[first_model].oos_returns)
             total = len(base_dates_f)
             start_idx = max(0, total - n_recent)
 
@@ -2673,20 +2751,48 @@ with tab9:
             for i in range(start_idx, total):
                 d = base_dates_f[i]
                 actual_future = base_future_ret_f[i]
-                actual_dir = "涨" if actual_future > 0 else "跌"
+                future_is_nan = bool(np.isnan(actual_future))
+                actual_dir = "待验证" if future_is_nan else ("涨" if actual_future > 0 else "跌")
 
                 row = {
                     "日期": pd.Timestamp(d).strftime("%Y-%m-%d") if hasattr(pd.Timestamp(d), 'strftime') else str(d)[:10],
                     "实际": actual_dir,
-                    f"持有{st.session_state.clf_forecast_days}日收益": f"{actual_future*100:+.2f}%",
+                    f"持有{st.session_state.clf_forecast_days}日收益": "N/A" if future_is_nan else f"{actual_future*100:+.2f}%",
                 }
 
-                # 融合概率列
+                # 融合信号 + 策略收益（用下一日收益计算）
+                if show_ensemble:
+                    fused_signal = ens["fused_signal"][i]
+                    row["策略信号"] = "多" if fused_signal == 1 else "空"
+                    ndr = base_next_day_f[i]
+                    ndr_nan = bool(np.isnan(ndr))
+                    if ndr_nan:
+                        row["策略收益"] = "N/A"
+                    elif fused_signal == 1:
+                        row["策略收益"] = f"{ndr*100:+.2f}%"
+                    else:
+                        row["策略收益"] = "0%"
+                else:
+                    sig = results[first_model].oos_predictions[i]
+                    row["策略信号"] = "多" if sig == 1 else "空"
+                    ndr = base_next_day_f[i]
+                    ndr_nan = bool(np.isnan(ndr))
+                    if ndr_nan:
+                        row["策略收益"] = "N/A"
+                    elif sig == 1:
+                        row["策略收益"] = f"{ndr*100:+.2f}%"
+                    else:
+                        row["策略收益"] = "0%"
+
+                # 融合概率列（模型预测的是下一日上涨概率）
                 if show_ensemble:
                     prob_fused = ens["fused_proba"][i]
                     fused_dir = "涨" if prob_fused >= st.session_state.clf_threshold else "跌"
-                    correct = "✓" if (prob_fused >= st.session_state.clf_threshold) == (actual_future > 0) else "✗"
-                    row["融合概率"] = f"{prob_fused:.3f} ({fused_dir}{correct})"
+                    if future_is_nan:
+                        row["下一日上涨概率"] = f"{prob_fused:.3f} (→ {fused_dir})"
+                    else:
+                        correct = "✓" if (prob_fused >= st.session_state.clf_threshold) == (actual_future > 0) else "✗"
+                        row["下一日上涨概率"] = f"{prob_fused:.3f} (→ {fused_dir} {correct})"
 
                 for model_name in st.session_state.clf_selected_models:
                     if model_name not in results:
@@ -2694,8 +2800,11 @@ with tab9:
                     r = results[model_name]
                     prob = r.oos_probabilities[i]
                     pred_dir = "涨" if prob >= st.session_state.clf_threshold else "跌"
-                    correct = "✓" if (prob >= st.session_state.clf_threshold) == (actual_future > 0) else "✗"
-                    row[f"{model_name}"] = f"{prob:.3f} ({pred_dir}{correct})"
+                    if future_is_nan:
+                        row[f"{model_name}"] = f"{prob:.3f} (→ {pred_dir})"
+                    else:
+                        correct = "✓" if (prob >= st.session_state.clf_threshold) == (actual_future > 0) else "✗"
+                        row[f"{model_name}"] = f"{prob:.3f} (→ {pred_dir} {correct})"
 
                 table_data.append(row)
 
@@ -2706,18 +2815,37 @@ with tab9:
         if first_model in results:
             base_dates_e = results[first_model].oos_dates
             base_future_ret_e = results[first_model].oos_future_ret
+            base_next_day_e = getattr(results[first_model], 'oos_next_day_ret', results[first_model].oos_returns)
             n_total = len(base_dates_e)
 
             export_rows = []
             for i in range(n_total):
+                fut_ret = base_future_ret_e[i]
+                fut_is_nan = bool(np.isnan(fut_ret))
+                ndr_e = base_next_day_e[i]
+                ndr_is_nan = bool(np.isnan(ndr_e))
                 row = {
                     "日期": pd.Timestamp(base_dates_e[i]).strftime("%Y-%m-%d") if hasattr(pd.Timestamp(base_dates_e[i]), 'strftime') else str(base_dates_e[i])[:10],
-                    f"持有{st.session_state.clf_forecast_days}日收益": round(float(base_future_ret_e[i]), 6),
-                    "实际涨跌": "涨" if base_future_ret_e[i] > 0 else "跌",
+                    f"持有{st.session_state.clf_forecast_days}日收益": None if fut_is_nan else round(float(fut_ret), 6),
+                    "实际涨跌": "待验证" if fut_is_nan else ("涨" if fut_ret > 0 else "跌"),
                 }
                 if show_ensemble and i < len(ens["fused_proba"]):
-                    row["融合概率"] = round(float(ens["fused_proba"][i]), 4)
-                    row["融合信号"] = "涨" if ens["fused_signal"][i] == 1 else "跌"
+                    row["下一日上涨概率"] = round(float(ens["fused_proba"][i]), 4)
+                    row["融合信号"] = "多" if ens["fused_signal"][i] == 1 else "空"
+                    if ndr_is_nan:
+                        row["策略收益"] = None
+                    elif ens["fused_signal"][i] == 1:
+                        row["策略收益"] = round(float(ndr_e), 6)
+                    else:
+                        row["策略收益"] = 0.0
+                elif first_model in results and i < len(results[first_model].oos_predictions):
+                    sig = results[first_model].oos_predictions[i]
+                    if ndr_is_nan:
+                        row["策略收益"] = None
+                    elif sig == 1:
+                        row["策略收益"] = round(float(ndr_e), 6)
+                    else:
+                        row["策略收益"] = 0.0
                 for model_name in st.session_state.clf_selected_models:
                     if model_name not in results:
                         continue
@@ -2745,6 +2873,123 @@ with tab9:
             rec = get_recommended_params(n, n_features)
             st.markdown(f"**当前数据量**: {n} 天, **可用特征**: {n_features} 个")
             st.info(f"推荐训练模式: **{rec['mode']}** (回溯: {rec['look_back']}天, 折数: {rec['n_splits']})")
+
+    # ── 预测历史 ──
+    st.markdown("---")
+    st.subheader("预测历史")
+
+    try:
+        from src.predict.clf_history_store import list_clf_sessions, load_clf_session, delete_clf_session
+        hist_sessions = list_clf_sessions(stock_code)
+    except Exception:
+        hist_sessions = []
+
+    if not hist_sessions:
+        st.caption("暂无历史预测记录，训练涨跌分类器后会自动保存")
+    else:
+        hist_options = {
+            f"#{s['session_id']} | {s.get('trained_at', '?')} | "
+            f"持有{s.get('forecast_days', '?')}天 | 阈值{s.get('threshold', '?')} | "
+            f"{s.get('selected_models', [])} | {s.get('total_samples', 0)}样本"
+            : s["session_id"]
+            for s in hist_sessions
+        }
+        selected_label = st.selectbox("选择历史记录", list(hist_options.keys()), key="clf_hist_select")
+        if selected_label:
+            hist_id = hist_options[selected_label]
+            hist = load_clf_session(hist_id)
+
+            if hist:
+                # 参数摘要
+                st.caption(
+                    f"持有天数: {hist.get('forecast_days')} | 阈值: {hist.get('threshold')} | "
+                    f"回溯: {hist.get('look_back')}天 | 折数: {hist.get('n_splits')} | "
+                    f"模型: {hist.get('selected_models')} | "
+                    f"数据: {hist.get('data_start_date')} ~ {hist.get('data_end_date')} | "
+                    f"OOS: {hist.get('oos_start_date')} ~ {hist.get('oos_end_date')}"
+                )
+
+                # 参数详情
+                params_hist = hist.get("params", {})
+                if params_hist:
+                    with st.expander("训练参数", expanded=False):
+                        st.json(params_hist)
+
+                # 融合指标卡
+                ens_m = hist.get("ensemble_metrics")
+                if ens_m:
+                    st.markdown("#### 融合集成指标")
+                    hc1, hc2, hc3, hc4, hc5, hc6, hc7, hc8 = st.columns(8)
+                    hc1.metric("AUC", f"{ens_m.get('auc', 0):.3f}" if ens_m.get('auc') is not None else "N/A")
+                    ic_v = ens_m.get('ic')
+                    hc2.metric("IC", f"{ic_v:.3f}" if ic_v is not None else "N/A")
+                    hc3.metric("年化收益", f"{ens_m.get('ann_return', 0)*100:+.2f}%")
+                    hc4.metric("年化波动", f"{ens_m.get('ann_volatility', 0)*100:.2f}%")
+                    hc5.metric("Sharpe", f"{ens_m.get('sharpe', 0):.2f}")
+                    hc6.metric("最大回撤", f"{ens_m.get('max_dd', 0)*100:.2f}%")
+                    hc7.metric("胜率", f"{ens_m.get('win_rate', 0)*100:.1f}%")
+                    hc8.metric("盈亏比", f"{ens_m.get('profit_loss_ratio', 0):.2f}")
+
+                # 累计净值曲线
+                details = hist.get("details", [])
+                if details:
+                    hist_dates = [d["trade_date"] for d in details]
+                    hist_probas = [d.get("next_day_proba") for d in details]
+                    hist_signals = [d.get("fused_signal") or 0 for d in details]
+                    hist_future = [d.get("future_ret") or 0 for d in details]
+                    hist_future_valid = [d.get("future_ret_valid", 1) for d in details]
+
+                    # 策略收益（只算有效行）
+                    hist_strategy = []
+                    for j in range(len(hist_dates)):
+                        if hist_future_valid[j] and hist_signals[j] == 1:
+                            hist_strategy.append(hist_future[j])
+                        else:
+                            hist_strategy.append(0.0)
+                    hist_cum = np.cumprod(1 + np.array(hist_strategy)) - 1
+
+                    st.markdown("#### 累计净值曲线")
+                    fig_hist = go.Figure()
+                    fig_hist.add_trace(go.Scatter(
+                        x=hist_dates, y=hist_cum * 100,
+                        name="融合集成", mode="lines",
+                        line=dict(color="#2ca02c", width=2)))
+                    fig_hist.update_layout(
+                        height=350,
+                        yaxis_title="累计收益率(%)",
+                        yaxis=dict(ticksuffix="%"),
+                        hovermode="x unified",
+                    )
+                    st.plotly_chart(fig_hist, use_container_width=True)
+
+                    # 明细表（最近 30 行）
+                    st.markdown("#### 预测明细（最近 30 天）")
+                    hist_table = []
+                    for d in details[-30:]:
+                        fr = d.get("future_ret")
+                        fr_valid = d.get("future_ret_valid", 1)
+                        sig = d.get("fused_signal") or 0
+                        is_nan = not fr_valid or fr is None
+                        strat_ret = 0.0
+                        if not is_nan and sig == 1:
+                            strat_ret = fr * 100
+                        hist_table.append({
+                            "日期": d["trade_date"],
+                            "下一日上涨概率": f"{d.get('next_day_proba', 0)*100:.1f}%" if d.get('next_day_proba') is not None else "N/A",
+                            "信号": "多" if sig == 1 else "空",
+                            "持有收益": "N/A" if is_nan else f"{fr*100:+.2f}%",
+                            "策略收益": "N/A" if is_nan else f"{strat_ret:+.2f}%",
+                        })
+                    st.dataframe(pd.DataFrame(hist_table), use_container_width=True, hide_index=True)
+
+                # 删除按钮
+                if st.button("删除此记录", key=f"clf_hist_del_{hist_id}", type="secondary"):
+                    try:
+                        delete_clf_session(hist_id)
+                        st.toast(f"已删除 Session #{hist_id}")
+                        st.rerun()
+                    except Exception as del_err:
+                        st.error(f"删除失败: {del_err}")
 
 
 # ═══════ 导出按钮处理 ═══════

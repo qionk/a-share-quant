@@ -130,7 +130,11 @@ def time_series_split(n_samples: int, n_splits: int = 5, min_train_size: int = 1
 
     for i in range(n_splits):
         train_end = min_train_size + fold_size * (i + 1)
-        val_end = min(train_end + fold_size, n_samples)
+        # 最后一折的验证集延伸到数据末尾，避免尾部样本不被覆盖
+        if i == n_splits - 1:
+            val_end = n_samples
+        else:
+            val_end = min(train_end + fold_size, n_samples)
         if train_end >= n_samples or val_end <= train_end:
             break
         train_idx = np.arange(0, train_end)

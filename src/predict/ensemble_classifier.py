@@ -34,20 +34,11 @@ warnings.filterwarnings("ignore")
 # ── 分类特征列（排除目标涨跌、目标收益率，保留所有量价衍生特征） ──
 
 CLF_FEATURE_COLS = [
-    # 基础价格 / 成交量
-    "close", "open", "high", "low", "volume",
-    # 技术指标（均线 / MACD / RSI / 布林带）
-    "ma5", "ma10", "ma20", "ma60",
-    "dif", "dea", "macd", "rsi",
-    "boll_upper", "boll_mid", "boll_lower",
-    # 涨跌幅
-    "pct_change",
-    # 成交量衍生（vol_ma5/ma20/obv/vol_ratio/vwap/vol_price_corr/vol_momentum）
-    "vol_ma5", "vol_ma20",
-    "obv", "vol_ratio", "vwap", "vol_price_corr", "vol_momentum",
-    # 收益率衍生（日收益率、日收益率_ma5）
-    "日收益率", "日收益率_ma5",
-    # preprocess_data 生成的量价配合特征（要求1: 保留量价衍生特征）
+    # 价格变化
+    "pct_change", "日收益率",
+    # 技术指标（最有信号量的几个）
+    "rsi", "dif", "macd",
+    # 量价配合（最关键的信息）
     "成交量变化率", "相对成交量", "量价配合度",
     "放量上涨", "缩量下跌",
 ]
@@ -66,6 +57,7 @@ class ClfResult:
     oos_actuals: np.ndarray = field(default_factory=lambda: np.array([]))
     oos_returns: np.ndarray = field(default_factory=lambda: np.array([]))
     oos_future_ret: np.ndarray = field(default_factory=lambda: np.array([]))
+    oos_next_day_ret: np.ndarray = field(default_factory=lambda: np.array([]))
     oos_dates: np.ndarray = field(default_factory=lambda: np.array([]))
     # CV 指标
     fold_metrics: dict = field(default_factory=dict)
@@ -74,6 +66,9 @@ class ClfResult:
     feature_importance: dict = field(default_factory=dict)
     training_time: float = 0.0
     feature_names: list = field(default_factory=list)
+    # 最新交易日实时预测（目标涨跌为 NaN 的最后一行）
+    latest_proba: float = np.nan
+    latest_date: object = None
 
 
 # ── 特征工程 ──
@@ -82,22 +77,24 @@ def create_clf_features(
     df: pd.DataFrame,
     feature_cols: List[str],
     look_back: int,
-) -> Tuple[np.ndarray, np.ndarray, List[str], pd.DatetimeIndex]:
+) -> Tuple[np.ndarray, np.ndarray, List[str], pd.DatetimeIndex,
+           np.ndarray, pd.DatetimeIndex]:
     """
     构建分类滞后特征（严格防泄漏）。
 
     对时刻 i，仅使用 [i-look_back, i-1] 的数据构造特征，
     目标 y[i] = df.iloc[i]['目标涨跌'] 预测的是 i→i+1 的涨跌方向。
 
-    df: 已预处理的 DataFrame（需包含 目标涨跌 和 feature_cols 中所有列）
-    feature_cols: 用作特征的列名列表
-    look_back: 回溯天数
+    最后一天（目标涨跌为 NaN）的特征也会构建，但 y 中对应位置为 NaN，
+    单独返回为 X_latest / latest_date，供实时预测使用。
 
-    返回: (X, y, feature_names, dates)
-      X: (n_samples, n_features * look_back) 原始值未归一化
-      y: (n_samples,) 0/1 标签
+    返回: (X, y, feature_names, dates, X_latest, latest_date)
+      X: (n_labeled, n_features * look_back) 有标签样本特征
+      y: (n_labeled,) 0/1 标签（仅非 NaN 行）
       feature_names: "col_lagN" 格式的特征名
-      dates: 对齐后的日期索引（与 X, y 一一对应）
+      dates: 有标签样本的对齐日期
+      X_latest: (1, n_features * look_back) 最新日特征（可能为空）
+      latest_date: 最新日日期（可能为 None）
     """
     if "目标涨跌" not in df.columns:
         raise ValueError("df 中缺少 '目标涨跌' 列，请先调用 preprocess_data()")
@@ -109,7 +106,8 @@ def create_clf_features(
     # 只保留需要的列 + 目标
     cols = feature_cols + ["目标涨跌"]
     df_sub = df[cols].copy()
-    df_sub = df_sub.dropna()
+    # 仅删除特征列有 NaN 的行，保留目标涨跌为 NaN 的最后一天
+    df_sub = df_sub.dropna(subset=feature_cols)
 
     if len(df_sub) <= look_back:
         raise ValueError(f"有效数据量 {len(df_sub)} <= look_back {look_back}，无法构造特征")
@@ -121,8 +119,23 @@ def create_clf_features(
         row = df_sub[feature_cols].iloc[i - look_back:i].values.flatten()
         X_list.append(row)
 
-    X = np.array(X_list, dtype=np.float64)
-    y = df_sub["目标涨跌"].values[look_back:].astype(int)
+    X_all = np.array(X_list, dtype=np.float64)
+    y_all = df_sub["目标涨跌"].values[look_back:]
+    dates_all = df_sub.index[look_back:]
+
+    # 分离有标签和无标签样本
+    labeled_mask = ~np.isnan(y_all)
+    X = X_all[labeled_mask]
+    y = y_all[labeled_mask].astype(int)
+    dates = dates_all[labeled_mask]
+
+    # 最新一天（目标涨跌为 NaN）
+    X_latest = np.array([], dtype=np.float64)
+    latest_date = None
+    unlabeled_mask = ~labeled_mask
+    if unlabeled_mask.any():
+        X_latest = X_all[unlabeled_mask][-1:]
+        latest_date = dates_all[unlabeled_mask][-1]
 
     # 构建特征名
     feature_names = []
@@ -130,7 +143,7 @@ def create_clf_features(
         for lag in range(look_back, 0, -1):
             feature_names.append(f"{col}_lag{lag}")
 
-    return X, y, feature_names, df_sub.index[look_back:]
+    return X, y, feature_names, dates, X_latest, latest_date
 
 
 # ── 模型构建 ──
@@ -215,13 +228,14 @@ def calculate_classification_metrics(
     predictions: np.ndarray,
     future_ret: np.ndarray = None,
     forecast_days: int = 1,
+    next_day_ret: np.ndarray = None,
 ) -> dict:
     """
     计算分类及策略指标。
 
-    策略逻辑: 预测涨(prob>=0.5)则做多，预测跌则空仓(收益=0)。
-    回测收益 = future_ret * predictions（N日持有期收益）。
-    若 future_ret 为 None，回退为 returns。
+    策略逻辑: 预测涨(prob>=threshold)则T日收盘买入、T+1日收盘卖出，
+    预测跌则空仓(收益=0)。回测收益 = next_day_ret * predictions（下一日收益）。
+    若 next_day_ret 为 None，回退为 returns。
 
     返回:
       auc, ic, ic_pvalue,
@@ -240,8 +254,8 @@ def calculate_classification_metrics(
     except ValueError:
         metrics["auc"] = np.nan
 
-    # IC: 预测概率与N日持有期收益的相关性
-    pnl = future_ret if future_ret is not None else returns
+    # IC: 预测概率与下一日实际收益的相关性
+    pnl = next_day_ret if next_day_ret is not None else returns
     mask = ~(np.isnan(y_pred_proba) | np.isnan(pnl))
     if mask.sum() >= 10:
         ic, ic_pv = pearsonr(y_pred_proba[mask], pnl[mask])
@@ -253,25 +267,31 @@ def calculate_classification_metrics(
 
     # 策略收益: 预测涨做多(future_ret)，预测跌空仓(收益=0)
     n = len(predictions)
-    strategy_returns = pnl[:n] * predictions
+    # 过滤 future_ret 为 NaN 的行（持有期超过数据末尾时无法验证）
+    pnl_slice = pnl[:n]
+    valid = ~np.isnan(pnl_slice)
+    n_valid = valid.sum()
+    strategy_returns = pnl_slice[valid] * predictions[valid]
+    if n_valid == 0:
+        strategy_returns = np.array([0.0])
     cum_series = np.cumprod(1 + strategy_returns)
     cum_return = cum_series[-1] - 1
     metrics["cum_return"] = float(cum_return)
 
-    # 年化收益（252 交易日）
-    if cum_return > -1 and n > 0:
-        metrics["ann_return"] = float((1 + cum_return) ** (252 / n) - 1)
+    # 年化收益（252 交易日，按有效样本数）
+    if cum_return > -1 and n_valid > 0:
+        metrics["ann_return"] = float((1 + cum_return) ** (252 / n_valid) - 1)
     else:
         metrics["ann_return"] = -1.0
 
     # 年化波动率
-    if np.std(strategy_returns) > 0 and n > 0:
+    if np.std(strategy_returns) > 0 and n_valid > 0:
         metrics["ann_volatility"] = float(np.std(strategy_returns) * np.sqrt(252))
     else:
         metrics["ann_volatility"] = 0.0
 
     # Sharpe（无风险利率 = 0）
-    if np.std(strategy_returns) > 0 and n > 0:
+    if np.std(strategy_returns) > 0 and n_valid > 0:
         metrics["sharpe"] = float(np.sqrt(252) * np.mean(strategy_returns) / np.std(strategy_returns))
     else:
         metrics["sharpe"] = 0.0
@@ -281,10 +301,10 @@ def calculate_classification_metrics(
     drawdowns = (cum_series - running_max) / running_max
     metrics["max_dd"] = float(drawdowns.min())
 
-    # 胜率（做多时的正确率，按N日持有期收益方向）
-    long_mask = predictions == 1
+    # 胜率（做多时的正确率，按N日持有期收益方向，仅有效行）
+    long_mask = predictions[valid] == 1
     if long_mask.sum() > 0:
-        metrics["win_rate"] = float((pnl[:n][long_mask] > 0).mean())
+        metrics["win_rate"] = float((pnl_slice[valid][long_mask] > 0).mean())
     else:
         metrics["win_rate"] = 0.0
 
@@ -325,6 +345,10 @@ def run_expanding_window(
     progress_cb: Optional[Callable] = None,
     future_ret: np.ndarray = None,
     forecast_days: int = 1,
+    next_day_ret: np.ndarray = None,
+    X_latest: np.ndarray = None,
+    latest_date: object = None,
+    all_returns: np.ndarray = None,
 ) -> Dict[str, ClfResult]:
     """
     严格扩展窗口时间序列训练 + 验证（禁止随机 shuffle / k-fold）。
@@ -363,9 +387,13 @@ def run_expanding_window(
         all_oos_returns = []
         all_oos_dates = []
         all_oos_future_ret = []
+        all_oos_next_day_ret = []
         fold_metrics_list = []
         fold_importances = []
         fold_count = len(splits)
+        last_fold_scaler = None  # ElasticNet 最后一折的 scaler
+        last_fold_garch_model = None  # 最后一折的 GARCH 模型
+        last_fold_train_returns = None
 
         for fold_i, (train_idx, val_idx) in enumerate(splits):
             if progress_cb:
@@ -381,6 +409,7 @@ def run_expanding_window(
             train_returns = returns[train_idx]
             val_returns = returns[val_idx]
             val_future_ret = future_ret[val_idx] if future_ret is not None else val_returns
+            val_next_day_ret = next_day_ret[val_idx] if next_day_ret is not None else val_returns
 
             # ── A. 仅在训练集上拟合 GARCH（要求 4: 防未来信息泄漏） ──
             garch_model = fit_garch(train_returns, p=1, q=1, dist='t')
@@ -433,16 +462,22 @@ def run_expanding_window(
             all_oos_actuals.append(y_val)
             all_oos_returns.append(val_returns)
             all_oos_future_ret.append(val_future_ret)
+            all_oos_next_day_ret.append(val_next_day_ret)
             all_oos_dates.append(val_dates)
 
-            # 折级指标
+            # 折级指标（策略P&L用 next_day_ret）
             fold_metrics = calculate_classification_metrics(
                 y_val, proba, val_returns, preds,
                 future_ret=val_future_ret, forecast_days=forecast_days,
+                next_day_ret=val_next_day_ret,
             )
             fold_metrics_list.append(fold_metrics)
 
             result.model_object = clf
+            if model_name == "ElasticNet":
+                last_fold_scaler = scaler
+            last_fold_garch_model = garch_model
+            last_fold_train_returns = train_returns
 
         # ── 聚合 OOS（按时序拼接，非末 N 个） ──
         result.oos_probabilities = np.concatenate(all_oos_probs)
@@ -450,7 +485,35 @@ def run_expanding_window(
         result.oos_actuals = np.concatenate(all_oos_actuals).astype(int)
         result.oos_returns = np.concatenate(all_oos_returns)
         result.oos_future_ret = np.concatenate(all_oos_future_ret)
+        result.oos_next_day_ret = np.concatenate(all_oos_next_day_ret)
         result.oos_dates = np.concatenate(all_oos_dates)
+
+        # ── 最新交易日实时预测 ──
+        if X_latest is not None and len(X_latest) > 0 and result.model_object is not None:
+            try:
+                # 用最后一折的训练集收益率构造 GARCH vol
+                _ret_for_garch = all_returns if all_returns is not None else last_fold_train_returns
+                if _ret_for_garch is not None:
+                    gm = fit_garch(_ret_for_garch, p=1, q=1, dist='t')
+                    if gm is not None:
+                        garch_vol_latest = _forecast_garch_vol(gm, 1)
+                    else:
+                        vol_std = np.std(_ret_for_garch[-60:]) if len(_ret_for_garch) >= 60 else np.std(_ret_for_garch)
+                        garch_vol_latest = np.array([vol_std])
+                else:
+                    garch_vol_latest = np.array([0.01])
+                garch_vol_latest = np.nan_to_num(garch_vol_latest, nan=0.01)
+
+                X_lat_aug = np.column_stack([X_latest, garch_vol_latest.reshape(-1, 1)])
+
+                if model_name == "ElasticNet" and last_fold_scaler is not None:
+                    X_lat_aug = last_fold_scaler.transform(X_lat_aug)
+
+                latest_proba = float(result.model_object.predict_proba(X_lat_aug)[0, 1])
+                result.latest_proba = latest_proba
+                result.latest_date = latest_date
+            except Exception:
+                pass
 
         # 特征重要性：多折平均（XGBoost）
         if fold_importances:
@@ -479,11 +542,12 @@ def run_expanding_window(
                 "cv_avg": avg_metrics,
             }
 
-        # 全量 OOS 指标（使用正确对齐的 oos_future_ret）
+        # 全量 OOS 指标（策略P&L用 next_day_ret）
         result.overall_metrics = calculate_classification_metrics(
             result.oos_actuals, result.oos_probabilities,
             result.oos_returns, result.oos_predictions,
             future_ret=result.oos_future_ret, forecast_days=forecast_days,
+            next_day_ret=result.oos_next_day_ret,
         )
 
         result.training_time = time.time() - t0
@@ -518,7 +582,7 @@ def get_recommended_params(n_samples: int, n_features: int = 30) -> dict:
                 "min_child_weight": 3, "reg_alpha": 0.5, "reg_lambda": 1.0,
             },
             "elasticnet": {
-                "C": 10.0, "l1_ratio": 0.5, "max_iter": 5000, "tol": 1e-3,
+                "C": 1.0, "l1_ratio": 0.5, "max_iter": 5000, "tol": 1e-3,
             },
             "look_back": min(10, max(3, n_samples // 10)),
             "n_splits": 3,
@@ -569,14 +633,14 @@ def get_recommended_params(n_samples: int, n_features: int = 30) -> dict:
         return {
             "mode": "large",
             "xgb": {
-                "n_estimators": 300, "max_depth": 6, "learning_rate": 0.01,
-                "subsample": 0.8, "colsample_bytree": 0.6,
-                "min_child_weight": 1, "reg_alpha": 0.01, "reg_lambda": 0.5,
+                "n_estimators": 40, "max_depth": 2, "learning_rate": 0.25,
+                "subsample": 0.6, "colsample_bytree": 0.7,
+                "min_child_weight": 12, "reg_alpha": 0.3, "reg_lambda": 2.0,
             },
             "elasticnet": {
                 "C": 0.1, "l1_ratio": 0.05, "max_iter": 5000, "tol": 1e-4,
             },
-            "look_back": min(30, max(15, n_samples // 25)),
+            "look_back": 4,
             "n_splits": 6,
         }
     elif n_samples < 3000:
@@ -686,12 +750,16 @@ def run_classifier_pipeline(
         progress_cb(0.1, "构造滞后特征...")
 
     # 4. 构造特征和目标（X: 纯滞后特征, y: 目标涨跌）
-    X, y, feature_names, aligned_dates = create_clf_features(df_ind, available_features, look_back)
+    X, y, feature_names, aligned_dates, X_latest, latest_date = create_clf_features(df_ind, available_features, look_back)
 
     # 5. 用 create_clf_features 返回的对齐日期做标签索引（防 dropna 偏移）
     returns = df_ind.loc[aligned_dates, "日收益率"].values
     future_ret = df_ind.loc[aligned_dates, "future_ret"].values
+    next_day_ret = df_ind.loc[aligned_dates, "next_day_ret"].values
     dates = np.array(aligned_dates)
+
+    # 全量收益率序列（用于 GARCH 拟合最新日预测）
+    all_returns = df_ind["日收益率"].dropna().values
 
     if progress_cb:
         progress_cb(0.15, f"有效样本: {len(X)} 行 × {len(feature_names)} 特征")
@@ -706,6 +774,10 @@ def run_classifier_pipeline(
         progress_cb=progress_cb,
         future_ret=future_ret,
         forecast_days=forecast_days,
+        next_day_ret=next_day_ret,
+        X_latest=X_latest,
+        latest_date=latest_date,
+        all_returns=all_returns,
     )
 
     # ── 7. 概率融合（如果两个模型都选中） ──
@@ -723,6 +795,7 @@ def run_classifier_pipeline(
             y_common = results[model_a].oos_actuals[:n_common]
             ret_common = results[model_a].oos_returns[:n_common]
             fut_common = results[model_a].oos_future_ret[:n_common]
+            ndr_common = results[model_a].oos_next_day_ret[:n_common]
             dates_common = results[model_a].oos_dates[:n_common]
 
             ensemble_metrics = calculate_classification_metrics(
@@ -730,6 +803,7 @@ def run_classifier_pipeline(
                 ret_common, fused_signal,
                 future_ret=fut_common,
                 forecast_days=forecast_days,
+                next_day_ret=ndr_common,
             )
 
             ensemble_result = {
@@ -739,6 +813,7 @@ def run_classifier_pipeline(
                 "oos_dates": dates_common,
                 "oos_returns": ret_common,
                 "oos_future_ret": fut_common,
+                "oos_next_day_ret": ndr_common,
                 "oos_actuals": y_common,
                 "threshold": threshold,
                 "forecast_days": forecast_days,

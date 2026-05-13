@@ -19,8 +19,8 @@ COLUMN_MAP = {
     "收盘": "close", "成交量": "volume", "成交额": "amount", "涨跌幅": "pct_change",
 }
 
-MAX_RETRIES = 3
-RETRY_DELAY = 2
+MAX_RETRIES = 2
+RETRY_DELAY = 1
 
 
 def _market_prefix(stock_code: str) -> str:
@@ -74,6 +74,27 @@ def _fetch_via_tencent(stock_code: str, start_date: str, end_date: str) -> pd.Da
     if not all_klines:
         return pd.DataFrame()
 
+    # 补齐：如果分页获取的最后日期不是 ed，单独请求最近几天补齐
+    last_fetched = all_klines[-1][0] if all_klines else None
+    if last_fetched and last_fetched < ed:
+        url = (f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+               f"?param={symbol},day,{last_fetched},{ed},30,qfq")
+        result = subprocess.run(
+            ["curl", "-s", "-m", "10", url],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            try:
+                data2 = json.loads(result.stdout)
+                klines2 = data2.get("data", {}).get(symbol, {})
+                klines2 = klines2.get("qfqday") or klines2.get("day", [])
+                if klines2:
+                    # 跳过已存在的第一天
+                    extra = [k for k in klines2 if k[0] > last_fetched]
+                    all_klines.extend(extra)
+            except json.JSONDecodeError:
+                pass
+
     # 去重（按日期）
     seen = set()
     unique = []
@@ -106,7 +127,7 @@ def load_from_akshare(stock_code: str, start_date: str, end_date: str) -> pd.Dat
     获取个股日线数据
     优先用 akshare，失败后切换到东方财富 datacenter 备用源
     """
-    # 尝试 akshare
+    # 尝试 akshare（快速失败，尽快 fallback 到腾讯源）
     df = None
     last_err = None
     for attempt in range(MAX_RETRIES):
@@ -129,6 +150,21 @@ def load_from_akshare(stock_code: str, start_date: str, end_date: str) -> pd.Dat
                     if col not in df.columns:
                         if col == "pct_change":
                             df["pct_change"] = df["close"].pct_change() * 100
+
+                # 检查 AKShare 数据是否覆盖到 end_date，否则用腾讯源补齐最新几天
+                end_ts = pd.Timestamp(end_date)
+                if df.index[-1] < end_ts:
+                    try:
+                        # 腾讯源只取 AKShare 缺失的日期段（前复权，价格可能不同，
+                        # 但仅用于最新几天的补齐，回测时 pct_change 仍有效）
+                        gap_start = (df.index[-1] + pd.Timedelta(days=1)).strftime("%Y%m%d")
+                        df_gap = _fetch_via_tencent(stock_code, gap_start, end_date)
+                        if df_gap is not None and not df_gap.empty:
+                            df = pd.concat([df, df_gap]).sort_index()
+                            df = df[~df.index.duplicated(keep="last")]
+                    except Exception:
+                        pass
+
                 return df
         except Exception as e:
             last_err = e

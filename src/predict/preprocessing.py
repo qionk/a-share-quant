@@ -36,10 +36,16 @@ def preprocess_data(df: pd.DataFrame, return_clip: float = 0.10,
     # ── 2. 涨跌标签 ──────────────────────────────
     df['涨跌标签'] = (df['日收益率'] > 0).astype(int)
 
-    # ── 3. 预测目标：N日持有期方向 ──────────────
+    # ── 3. 预测目标：下一日涨跌方向（固定1日，与持有期无关） ──
     df['future_ret'] = df['close'].pct_change(periods=forecast_days).shift(-forecast_days)
-    df['目标涨跌'] = (df['future_ret'] > 0).astype(int)
     df['目标收益率'] = df['future_ret']
+    # 训练目标始终是下一日方向
+    _next_ret = df['close'].pct_change(periods=1).shift(-1)
+    df['目标涨跌'] = _next_ret.gt(0).astype(float)
+    df.loc[_next_ret.isna(), '目标涨跌'] = np.nan
+
+    # 策略回测用：下一日收益率（T日收盘买入 → T+1日收盘卖出）
+    df['next_day_ret'] = df['日收益率'].shift(-1)
 
     # ── 4. 成交量衍生特征 ─────────────────────────
     # 成交量变化率
@@ -59,7 +65,9 @@ def preprocess_data(df: pd.DataFrame, return_clip: float = 0.10,
     df['缩量下跌'] = ((df['日收益率'] < 0) & (df['相对成交量'] < 0.7)).astype(int)
 
     # ── 5. 处理缺失值 ─────────────────────────────
-    df = df.dropna(subset=['future_ret'])
+    # 保留 目标涨跌/future_ret/next_day_ret 为 NaN 的行（最后一天无下日数据），
+    # 仅删除特征列（日收益率）为 NaN 的行（首行）
+    df = df.dropna(subset=['日收益率'])
 
     return df
 
