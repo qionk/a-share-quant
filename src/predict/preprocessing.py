@@ -9,15 +9,17 @@ import numpy as np
 import pandas as pd
 
 
-def preprocess_data(df: pd.DataFrame, return_clip: float = 0.10) -> pd.DataFrame:
+def preprocess_data(df: pd.DataFrame, return_clip: float = 0.10,
+                     forecast_days: int = 1) -> pd.DataFrame:
     """
     统一数据预处理：计算日收益率目标 + 成交量衍生特征
 
     返回的 DataFrame 新增列：
-      日收益率, 目标收益率, 涨跌标签, 目标涨跌,
+      日收益率, future_ret, 目标收益率, 涨跌标签, 目标涨跌,
       成交量变化率, 相对成交量, 量价配合度, 放量上涨, 缩量下跌
 
     df 必须已有列: close, volume, pct_change（或从close计算）
+    forecast_days: 持有天数，N日持有期收益 = close.pct_change(N).shift(-N)
     """
     df = df.copy()
 
@@ -34,9 +36,10 @@ def preprocess_data(df: pd.DataFrame, return_clip: float = 0.10) -> pd.DataFrame
     # ── 2. 涨跌标签 ──────────────────────────────
     df['涨跌标签'] = (df['日收益率'] > 0).astype(int)
 
-    # ── 3. 预测目标：下一天的收益率 ────────────────
-    df['目标收益率'] = df['日收益率'].shift(-1)
-    df['目标涨跌'] = df['涨跌标签'].shift(-1)
+    # ── 3. 预测目标：N日持有期方向 ──────────────
+    df['future_ret'] = df['close'].pct_change(periods=forecast_days).shift(-forecast_days)
+    df['目标涨跌'] = (df['future_ret'] > 0).astype(int)
+    df['目标收益率'] = df['future_ret']
 
     # ── 4. 成交量衍生特征 ─────────────────────────
     # 成交量变化率
@@ -56,7 +59,7 @@ def preprocess_data(df: pd.DataFrame, return_clip: float = 0.10) -> pd.DataFrame
     df['缩量下跌'] = ((df['日收益率'] < 0) & (df['相对成交量'] < 0.7)).astype(int)
 
     # ── 5. 处理缺失值 ─────────────────────────────
-    df = df.dropna(subset=['目标收益率'])
+    df = df.dropna(subset=['future_ret'])
 
     return df
 

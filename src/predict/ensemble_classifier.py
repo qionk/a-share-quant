@@ -65,6 +65,7 @@ class ClfResult:
     oos_predictions: np.ndarray = field(default_factory=lambda: np.array([]))
     oos_actuals: np.ndarray = field(default_factory=lambda: np.array([]))
     oos_returns: np.ndarray = field(default_factory=lambda: np.array([]))
+    oos_future_ret: np.ndarray = field(default_factory=lambda: np.array([]))
     oos_dates: np.ndarray = field(default_factory=lambda: np.array([]))
     # CV 指标
     fold_metrics: dict = field(default_factory=dict)
@@ -81,7 +82,7 @@ def create_clf_features(
     df: pd.DataFrame,
     feature_cols: List[str],
     look_back: int,
-) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+) -> Tuple[np.ndarray, np.ndarray, List[str], pd.DatetimeIndex]:
     """
     构建分类滞后特征（严格防泄漏）。
 
@@ -92,10 +93,11 @@ def create_clf_features(
     feature_cols: 用作特征的列名列表
     look_back: 回溯天数
 
-    返回: (X, y, feature_names)
+    返回: (X, y, feature_names, dates)
       X: (n_samples, n_features * look_back) 原始值未归一化
       y: (n_samples,) 0/1 标签
       feature_names: "col_lagN" 格式的特征名
+      dates: 对齐后的日期索引（与 X, y 一一对应）
     """
     if "目标涨跌" not in df.columns:
         raise ValueError("df 中缺少 '目标涨跌' 列，请先调用 preprocess_data()")
@@ -128,7 +130,7 @@ def create_clf_features(
         for lag in range(look_back, 0, -1):
             feature_names.append(f"{col}_lag{lag}")
 
-    return X, y, feature_names
+    return X, y, feature_names, df_sub.index[look_back:]
 
 
 # ── 模型构建 ──
@@ -141,6 +143,10 @@ def build_xgb_classifier(params: dict):
         max_depth=params.get("max_depth", 6),
         learning_rate=params.get("learning_rate", 0.1),
         subsample=params.get("subsample", 0.8),
+        colsample_bytree=params.get("colsample_bytree", 0.8),
+        min_child_weight=params.get("min_child_weight", 1),
+        reg_alpha=params.get("reg_alpha", 0.0),
+        reg_lambda=params.get("reg_lambda", 1.0),
         objective="binary:logistic",
         eval_metric="logloss",
         random_state=42,
@@ -157,6 +163,7 @@ def build_elasticnet(params: dict):
         penalty="elasticnet",
         solver="saga",
         max_iter=params.get("max_iter", 5000),
+        tol=params.get("tol", 1e-3),
         random_state=42,
         n_jobs=-1,
     )
@@ -206,16 +213,20 @@ def calculate_classification_metrics(
     y_pred_proba: np.ndarray,
     returns: np.ndarray,
     predictions: np.ndarray,
+    future_ret: np.ndarray = None,
+    forecast_days: int = 1,
 ) -> dict:
     """
     计算分类及策略指标。
 
-    策略逻辑: 预测涨(prob>=0.5)则做多(持有)，预测跌则空仓(收益=0)。
+    策略逻辑: 预测涨(prob>=0.5)则做多，预测跌则空仓(收益=0)。
+    回测收益 = future_ret * predictions（N日持有期收益）。
+    若 future_ret 为 None，回退为 returns。
 
     返回:
       auc, ic, ic_pvalue,
-      cum_return, ann_return, sharpe, max_dd, win_rate,
-      accuracy, precision, recall, confusion
+      cum_return, ann_return, ann_volatility, sharpe, max_dd, win_rate,
+      profit_loss_ratio, accuracy, precision, recall, confusion
     """
     metrics = {}
 
@@ -229,19 +240,20 @@ def calculate_classification_metrics(
     except ValueError:
         metrics["auc"] = np.nan
 
-    # IC: 预测概率与实际收益率的相关性
-    mask = ~(np.isnan(y_pred_proba) | np.isnan(returns))
+    # IC: 预测概率与N日持有期收益的相关性
+    pnl = future_ret if future_ret is not None else returns
+    mask = ~(np.isnan(y_pred_proba) | np.isnan(pnl))
     if mask.sum() >= 10:
-        ic, ic_pv = pearsonr(y_pred_proba[mask], returns[mask])
+        ic, ic_pv = pearsonr(y_pred_proba[mask], pnl[mask])
         metrics["ic"] = float(ic)
         metrics["ic_pvalue"] = float(ic_pv)
     else:
         metrics["ic"] = np.nan
         metrics["ic_pvalue"] = np.nan
 
-    # 策略收益: 预测涨做多(收益=实际收益)，预测跌空仓(收益=0)
+    # 策略收益: 预测涨做多(future_ret)，预测跌空仓(收益=0)
     n = len(predictions)
-    strategy_returns = returns[:n] * predictions
+    strategy_returns = pnl[:n] * predictions
     cum_series = np.cumprod(1 + strategy_returns)
     cum_return = cum_series[-1] - 1
     metrics["cum_return"] = float(cum_return)
@@ -251,6 +263,12 @@ def calculate_classification_metrics(
         metrics["ann_return"] = float((1 + cum_return) ** (252 / n) - 1)
     else:
         metrics["ann_return"] = -1.0
+
+    # 年化波动率
+    if np.std(strategy_returns) > 0 and n > 0:
+        metrics["ann_volatility"] = float(np.std(strategy_returns) * np.sqrt(252))
+    else:
+        metrics["ann_volatility"] = 0.0
 
     # Sharpe（无风险利率 = 0）
     if np.std(strategy_returns) > 0 and n > 0:
@@ -263,12 +281,20 @@ def calculate_classification_metrics(
     drawdowns = (cum_series - running_max) / running_max
     metrics["max_dd"] = float(drawdowns.min())
 
-    # 胜率（做多时的正确率）
+    # 胜率（做多时的正确率，按N日持有期收益方向）
     long_mask = predictions == 1
     if long_mask.sum() > 0:
-        metrics["win_rate"] = float((returns[:n][long_mask] > 0).mean())
+        metrics["win_rate"] = float((pnl[:n][long_mask] > 0).mean())
     else:
         metrics["win_rate"] = 0.0
+
+    # 盈亏比: 平均正收益 / 平均负收益的绝对值
+    pos_ret = strategy_returns[strategy_returns > 0]
+    neg_ret = strategy_returns[strategy_returns < 0]
+    if len(neg_ret) > 0 and np.abs(neg_ret.mean()) > 1e-12:
+        metrics["profit_loss_ratio"] = float(pos_ret.mean() / np.abs(neg_ret.mean())) if len(pos_ret) > 0 else np.inf
+    else:
+        metrics["profit_loss_ratio"] = np.inf if len(pos_ret) > 0 else 0.0
 
     # 混淆矩阵
     tp = int(((predictions == 1) & (y_true[:n] == 1)).sum())
@@ -297,6 +323,8 @@ def run_expanding_window(
     n_splits: int = 5,
     min_train_size: int = 100,
     progress_cb: Optional[Callable] = None,
+    future_ret: np.ndarray = None,
+    forecast_days: int = 1,
 ) -> Dict[str, ClfResult]:
     """
     严格扩展窗口时间序列训练 + 验证（禁止随机 shuffle / k-fold）。
@@ -310,6 +338,8 @@ def run_expanding_window(
     X, y, returns, dates: 已对齐的完整数据（由 create_clf_features 产出）
     models: ["XGBoost", "ElasticNet"] 子集
     params: {"XGBoost": {...}, "ElasticNet": {...}}
+    future_ret: N日持有期收益（用于回测P&L），None则回退为returns
+    forecast_days: 持有天数
 
     返回: {model_name: ClfResult}
     """
@@ -332,6 +362,7 @@ def run_expanding_window(
         all_oos_actuals = []
         all_oos_returns = []
         all_oos_dates = []
+        all_oos_future_ret = []
         fold_metrics_list = []
         fold_importances = []
         fold_count = len(splits)
@@ -349,6 +380,7 @@ def run_expanding_window(
             val_dates = dates[val_idx]
             train_returns = returns[train_idx]
             val_returns = returns[val_idx]
+            val_future_ret = future_ret[val_idx] if future_ret is not None else val_returns
 
             # ── A. 仅在训练集上拟合 GARCH（要求 4: 防未来信息泄漏） ──
             garch_model = fit_garch(train_returns, p=1, q=1, dist='t')
@@ -400,11 +432,13 @@ def run_expanding_window(
             all_oos_preds.append(preds)
             all_oos_actuals.append(y_val)
             all_oos_returns.append(val_returns)
+            all_oos_future_ret.append(val_future_ret)
             all_oos_dates.append(val_dates)
 
             # 折级指标
             fold_metrics = calculate_classification_metrics(
-                y_val, proba, val_returns, preds
+                y_val, proba, val_returns, preds,
+                future_ret=val_future_ret, forecast_days=forecast_days,
             )
             fold_metrics_list.append(fold_metrics)
 
@@ -415,6 +449,7 @@ def run_expanding_window(
         result.oos_predictions = np.concatenate(all_oos_preds).astype(int)
         result.oos_actuals = np.concatenate(all_oos_actuals).astype(int)
         result.oos_returns = np.concatenate(all_oos_returns)
+        result.oos_future_ret = np.concatenate(all_oos_future_ret)
         result.oos_dates = np.concatenate(all_oos_dates)
 
         # 特征重要性：多折平均（XGBoost）
@@ -444,10 +479,11 @@ def run_expanding_window(
                 "cv_avg": avg_metrics,
             }
 
-        # 全量 OOS 指标（使用正确对齐的 oos_returns）
+        # 全量 OOS 指标（使用正确对齐的 oos_future_ret）
         result.overall_metrics = calculate_classification_metrics(
             result.oos_actuals, result.oos_probabilities,
             result.oos_returns, result.oos_predictions,
+            future_ret=result.oos_future_ret, forecast_days=forecast_days,
         )
 
         result.training_time = time.time() - t0
@@ -462,38 +498,114 @@ def run_expanding_window(
 # ── 智能参数推荐 ──
 
 def get_recommended_params(n_samples: int, n_features: int = 30) -> dict:
-    """根据有效样本量返回推荐参数。4 档: tiny(<200) / small(200-500) / medium(500-1000) / large(>1000)"""
+    """根据有效样本量返回推荐参数。
+
+    7 档:
+      tiny       < 200
+      small      200-500
+      medium     500-800
+      med_large  800-1200
+      large      1200-2000
+      xlarge     2000-3000
+      xxlarge    > 3000
+    """
     if n_samples < 200:
         return {
             "mode": "tiny",
-            "xgb": {"n_estimators": 50, "max_depth": 3, "learning_rate": 0.1, "subsample": 0.8},
-            "elasticnet": {"C": 10.0, "l1_ratio": 0.5, "max_iter": 5000},
+            "xgb": {
+                "n_estimators": 50, "max_depth": 3, "learning_rate": 0.1,
+                "subsample": 0.8, "colsample_bytree": 0.8,
+                "min_child_weight": 3, "reg_alpha": 0.5, "reg_lambda": 1.0,
+            },
+            "elasticnet": {
+                "C": 10.0, "l1_ratio": 0.5, "max_iter": 5000, "tol": 1e-3,
+            },
             "look_back": min(10, max(3, n_samples // 10)),
             "n_splits": 3,
         }
     elif n_samples < 500:
         return {
             "mode": "small",
-            "xgb": {"n_estimators": 100, "max_depth": 4, "learning_rate": 0.05, "subsample": 0.8},
-            "elasticnet": {"C": 1.0, "l1_ratio": 0.3, "max_iter": 5000},
+            "xgb": {
+                "n_estimators": 100, "max_depth": 4, "learning_rate": 0.05,
+                "subsample": 0.8, "colsample_bytree": 0.8,
+                "min_child_weight": 2, "reg_alpha": 0.3, "reg_lambda": 1.0,
+            },
+            "elasticnet": {
+                "C": 1.0, "l1_ratio": 0.3, "max_iter": 5000, "tol": 1e-3,
+            },
             "look_back": min(15, max(5, n_samples // 15)),
             "n_splits": 4,
         }
-    elif n_samples < 1000:
+    elif n_samples < 800:
         return {
             "mode": "medium",
-            "xgb": {"n_estimators": 200, "max_depth": 5, "learning_rate": 0.03, "subsample": 0.8},
-            "elasticnet": {"C": 0.5, "l1_ratio": 0.15, "max_iter": 5000},
+            "xgb": {
+                "n_estimators": 150, "max_depth": 5, "learning_rate": 0.03,
+                "subsample": 0.8, "colsample_bytree": 0.7,
+                "min_child_weight": 1, "reg_alpha": 0.1, "reg_lambda": 1.0,
+            },
+            "elasticnet": {
+                "C": 0.5, "l1_ratio": 0.15, "max_iter": 5000, "tol": 1e-4,
+            },
             "look_back": min(20, max(10, n_samples // 20)),
             "n_splits": 5,
         }
-    else:
+    elif n_samples < 1200:
+        return {
+            "mode": "med_large",
+            "xgb": {
+                "n_estimators": 200, "max_depth": 6, "learning_rate": 0.02,
+                "subsample": 0.8, "colsample_bytree": 0.7,
+                "min_child_weight": 1, "reg_alpha": 0.05, "reg_lambda": 0.5,
+            },
+            "elasticnet": {
+                "C": 0.2, "l1_ratio": 0.1, "max_iter": 5000, "tol": 1e-4,
+            },
+            "look_back": min(25, max(12, n_samples // 25)),
+            "n_splits": 5,
+        }
+    elif n_samples < 2000:
         return {
             "mode": "large",
-            "xgb": {"n_estimators": 300, "max_depth": 6, "learning_rate": 0.01, "subsample": 0.8},
-            "elasticnet": {"C": 0.1, "l1_ratio": 0.05, "max_iter": 5000},
+            "xgb": {
+                "n_estimators": 300, "max_depth": 6, "learning_rate": 0.01,
+                "subsample": 0.8, "colsample_bytree": 0.6,
+                "min_child_weight": 1, "reg_alpha": 0.01, "reg_lambda": 0.5,
+            },
+            "elasticnet": {
+                "C": 0.1, "l1_ratio": 0.05, "max_iter": 5000, "tol": 1e-4,
+            },
             "look_back": min(30, max(15, n_samples // 25)),
             "n_splits": 6,
+        }
+    elif n_samples < 3000:
+        return {
+            "mode": "xlarge",
+            "xgb": {
+                "n_estimators": 400, "max_depth": 7, "learning_rate": 0.01,
+                "subsample": 0.7, "colsample_bytree": 0.6,
+                "min_child_weight": 1, "reg_alpha": 0.01, "reg_lambda": 0.3,
+            },
+            "elasticnet": {
+                "C": 0.05, "l1_ratio": 0.03, "max_iter": 8000, "tol": 1e-4,
+            },
+            "look_back": min(30, max(20, n_samples // 30)),
+            "n_splits": 7,
+        }
+    else:
+        return {
+            "mode": "xxlarge",
+            "xgb": {
+                "n_estimators": 500, "max_depth": 8, "learning_rate": 0.005,
+                "subsample": 0.7, "colsample_bytree": 0.5,
+                "min_child_weight": 1, "reg_alpha": 0.0, "reg_lambda": 0.1,
+            },
+            "elasticnet": {
+                "C": 0.02, "l1_ratio": 0.02, "max_iter": 10000, "tol": 1e-4,
+            },
+            "look_back": min(40, max(20, n_samples // 35)),
+            "n_splits": 8,
         }
 
 
@@ -531,14 +643,17 @@ def run_classifier_pipeline(
     look_back: int = 20,
     n_splits: int = 5,
     progress_cb: Optional[Callable] = None,
-) -> Dict[str, ClfResult]:
+    forecast_days: int = 1,
+    threshold: float = 0.5,
+):
     """
     分类器完整管线。
 
-    1. preprocess_data → 日收益率 / 涨跌标签 / 目标涨跌 / 量价衍生特征
+    1. preprocess_data → 日收益率 / future_ret / 目标涨跌 / 量价衍生特征
     2. compute_technical_indicators → MA / MACD / RSI / 布林带 / OBV 等
     3. create_clf_features → 滞后特征展平（严格防泄漏）
     4. run_expanding_window → 扩展窗口训练+验证 + GARCH 注入
+    5. 概率融合 → final_proba = (proba_a + proba_b) / 2, signal = final_proba >= threshold
 
     df: 原始 OHLCV DataFrame（index 为日期）
     selected_models: ["XGBoost", "ElasticNet"] 子集
@@ -546,15 +661,17 @@ def run_classifier_pipeline(
     look_back: 特征回溯天数
     n_splits: 扩展窗口折数
     progress_cb: callable(pct, msg) 进度回调
+    forecast_days: 持有天数（N日持有期收益）
+    threshold: 融合概率阈值
 
-    返回: {model_name: ClfResult}
+    返回: (results: Dict[str, ClfResult], ensemble_result: dict | None)
     """
     if progress_cb:
         progress_cb(0.0, "数据预处理中...")
 
-    # 1. 预处理（添加 日收益率 / 涨跌标签 / 目标涨跌 / 成交量变化率 / 相对成交量 /
+    # 1. 预处理（添加 日收益率 / future_ret / 目标涨跌 / 成交量变化率 / 相对成交量 /
     #    量价配合度 / 放量上涨 / 缩量下跌）
-    df_proc = preprocess_data(df)
+    df_proc = preprocess_data(df, forecast_days=forecast_days)
 
     # 2. 技术指标（添加 MA / MACD / RSI / 布林带 / OBV / vol_ma / vwap 等，
     #    全部仅用历史数据，无前视）
@@ -569,17 +686,12 @@ def run_classifier_pipeline(
         progress_cb(0.1, "构造滞后特征...")
 
     # 4. 构造特征和目标（X: 纯滞后特征, y: 目标涨跌）
-    X, y, feature_names = create_clf_features(df_ind, available_features, look_back)
+    X, y, feature_names, aligned_dates = create_clf_features(df_ind, available_features, look_back)
 
-    # 5. 对齐 returns 和 dates（跳过前 look_back 天，与 create_clf_features 一致）
-    returns = df_ind["日收益率"].values[look_back:]
-    dates = df_ind.index[look_back:]
-
-    n_common = min(len(X), len(returns), len(dates))
-    X = X[:n_common]
-    y = y[:n_common]
-    returns = returns[:n_common]
-    dates = dates[:n_common]
+    # 5. 用 create_clf_features 返回的对齐日期做标签索引（防 dropna 偏移）
+    returns = df_ind.loc[aligned_dates, "日收益率"].values
+    future_ret = df_ind.loc[aligned_dates, "future_ret"].values
+    dates = np.array(aligned_dates)
 
     if progress_cb:
         progress_cb(0.15, f"有效样本: {len(X)} 行 × {len(feature_names)} 特征")
@@ -592,9 +704,47 @@ def run_classifier_pipeline(
         params=params,
         n_splits=n_splits,
         progress_cb=progress_cb,
+        future_ret=future_ret,
+        forecast_days=forecast_days,
     )
+
+    # ── 7. 概率融合（如果两个模型都选中） ──
+    ensemble_result = None
+    if len(selected_models) == 2:
+        model_a, model_b = selected_models[0], selected_models[1]
+        if model_a in results and model_b in results:
+            proba_a = results[model_a].oos_probabilities
+            proba_b = results[model_b].oos_probabilities
+            n_common = min(len(proba_a), len(proba_b))
+
+            fused_proba = (proba_a[:n_common] + proba_b[:n_common]) / 2.0
+            fused_signal = (fused_proba >= threshold).astype(int)
+
+            y_common = results[model_a].oos_actuals[:n_common]
+            ret_common = results[model_a].oos_returns[:n_common]
+            fut_common = results[model_a].oos_future_ret[:n_common]
+            dates_common = results[model_a].oos_dates[:n_common]
+
+            ensemble_metrics = calculate_classification_metrics(
+                y_common, fused_proba,
+                ret_common, fused_signal,
+                future_ret=fut_common,
+                forecast_days=forecast_days,
+            )
+
+            ensemble_result = {
+                "fused_proba": fused_proba,
+                "fused_signal": fused_signal,
+                "metrics": ensemble_metrics,
+                "oos_dates": dates_common,
+                "oos_returns": ret_common,
+                "oos_future_ret": fut_common,
+                "oos_actuals": y_common,
+                "threshold": threshold,
+                "forecast_days": forecast_days,
+            }
 
     if progress_cb:
         progress_cb(1.0, "涨跌预测完成!")
 
-    return results
+    return results, ensemble_result
