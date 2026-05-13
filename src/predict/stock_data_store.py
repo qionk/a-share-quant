@@ -203,7 +203,7 @@ def list_stocks_with_status() -> list:
     for r in rows:
         r["code"] = r["stock_code"]
         r["name"] = r["stock_name"]
-        r["rows"] = min(r.get("data_rows", 0), 500)
+        r["rows"] = r.get("data_rows", 0)
         r["trained"] = r["trained_at"] is not None
         r["start_date"] = r["start_date"].strftime("%Y-%m-%d") if hasattr(r["start_date"], "strftime") else str(r["start_date"])
         r["end_date"] = r["end_date"].strftime("%Y-%m-%d") if hasattr(r["end_date"], "strftime") else str(r["end_date"])
@@ -280,36 +280,54 @@ def fetch_and_store(stock_code: str, start_date: str = "20200101",
     if progress_callback:
         progress_callback("checking")
 
-    # 已存在则直接返回
+    # 已存在则检查是否需要重新获取
     if has_stock_data(stock_code):
         df = load_stock_from_db(stock_code)
         name = get_stock_name_from_db(stock_code)
-        # 检查数据是否过时（最新日期 < 今天），自动增量更新
-        if not df.empty:
+
+        if df.empty:
+            # 空数据，走重新获取流程
+            pass
+        else:
             last_date = df.index[-1]
             today = pd.Timestamp.now().normalize()
-            if last_date < today - pd.Timedelta(days=1):
+            db_start = df.index[0].strftime("%Y%m%d") if hasattr(df.index[0], 'strftime') else str(df.index[0])[:10].replace("-", "")
+
+            # 若请求的起始日期早于DB中最早日期，需要重新获取全量数据
+            if start_date < db_start:
                 if progress_callback:
-                    progress_callback("updating")
-                from src.predict.data_input import load_from_akshare
-                new_start = (last_date + pd.Timedelta(days=1)).strftime("%Y%m%d")
-                new_end = end_date or datetime.now().strftime("%Y%m%d")
-                try:
-                    df_new = load_from_akshare(stock_code, new_start, new_end)
-                    if df_new is not None and len(df_new) > 0:
-                        store_stock_data(stock_code, name, df_new)
-                        df = pd.concat([df, df_new]).sort_index()
-                        df = df[~df.index.duplicated(keep="last")]
-                except Exception as e:
+                    progress_callback("refetching")
+                delete_stock_data(stock_code)
+                # 跳出 if 块，走下面的全量获取
+            else:
+                # 已有数据在请求范围内，仅增量更新
+                if last_date < today - pd.Timedelta(days=1):
                     if progress_callback:
-                        progress_callback("update_failed")
-        # 截取最近 max_days 天（无论是否更新，始终限制数据量）
-        if max_days and len(df) > max_days:
-            df = df.tail(max_days)
-            _trim_stock_data(stock_code, max_days)
-        if progress_callback:
-            progress_callback("done")
-        return df, name, True
+                        progress_callback("updating")
+                    from src.predict.data_input import load_from_akshare
+                    new_start = (last_date + pd.Timedelta(days=1)).strftime("%Y%m%d")
+                    new_end = end_date or datetime.now().strftime("%Y%m%d")
+                    try:
+                        df_new = load_from_akshare(stock_code, new_start, new_end)
+                        if df_new is not None and len(df_new) > 0:
+                            store_stock_data(stock_code, name, df_new)
+                            df = pd.concat([df, df_new]).sort_index()
+                            df = df[~df.index.duplicated(keep="last")]
+                    except Exception as e:
+                        if progress_callback:
+                            progress_callback("update_failed")
+
+                # 按请求的起始日期截取
+                req_start = pd.Timestamp(start_date)
+                df = df[df.index >= req_start]
+
+                # 按 max_days 截取
+                if max_days and len(df) > max_days:
+                    df = df.tail(max_days)
+                    _trim_stock_data(stock_code, max_days)
+                if progress_callback:
+                    progress_callback("done")
+                return df, name, True
 
     if progress_callback:
         progress_callback("fetching")

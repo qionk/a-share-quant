@@ -16,7 +16,7 @@ import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
@@ -663,6 +663,19 @@ with st.sidebar:
     data_source = st.radio("数据来源", ["数据库加载", "Excel上传"], horizontal=True)
 
     if data_source == "数据库加载":
+        # 日期区间选择
+        col_d1, col_d2 = st.columns(2)
+        with col_d1:
+            custom_start = st.date_input("起始日期", value=date(2020, 1, 1),
+                                         min_value=date(1990, 1, 1), max_value=date.today(),
+                                         key="custom_start_date")
+        with col_d2:
+            custom_end = st.date_input("结束日期", value=date.today(),
+                                       min_value=date(1990, 1, 1), max_value=date.today(),
+                                       key="custom_end_date")
+        start_d = custom_start.strftime("%Y%m%d")
+        end_d = custom_end.strftime("%Y%m%d")
+
         if st.button("刷新列表", key="refresh_db_stocks"):
             try:
                 st.session_state.db_stocks = list_stocks_with_status()
@@ -680,7 +693,6 @@ with st.sidebar:
             stock_labels = {}
             for s in stock_list:
                 # 数据新鲜度
-                from datetime import date
                 today_str = date.today().strftime("%Y-%m-%d")
                 end_date = s["end_date"]
                 if end_date == today_str:
@@ -729,11 +741,14 @@ with st.sidebar:
                 if st.button("加载", type="primary", use_container_width=True, key="load_db_btn"):
                     with st.spinner(f"加载 {info['name']}...并检查数据更新..."):
                         try:
-                            from datetime import date as _date
-                            _is_fresh = info["end_date"] >= _date.today().strftime("%Y-%m-%d")
+                            _is_fresh = info["end_date"] >= date.today().strftime("%Y-%m-%d")
                             if not _is_fresh:
                                 st.toast(f"正在更新 {info['name']} 的数据...")
-                            df, _, _ = fetch_and_store(info["code"])
+                            # 若要求的起始日早于DB最早日，则删除重建
+                            if start_d < info["start_date"]:
+                                delete_stock_data(info["code"])
+                            df, _, _ = fetch_and_store(info["code"], start_date=start_d,
+                                                        end_date=end_d, max_days=10000)
                             st.session_state.stock_data = df
                             st.session_state.stock_code = info["code"]
                             st.session_state.stock_name = info["name"]
@@ -763,35 +778,35 @@ with st.sidebar:
         st.divider()
         st.caption("添加新股")
         new_code = st.text_input("股票代码", key="new_stock_code", placeholder="6位代码")
-        full_history = st.checkbox("全量历史数据（从上市首日，适合需要大样本的模型）", key="full_history")
+
         if new_code and len(new_code) == 6:
             exists = False
             try:
                 exists = has_stock_data(new_code) or any(s["code"] == new_code for s in st.session_state.db_stocks)
             except Exception:
                 pass
-            if exists and not full_history:
-                st.info("该股票数据已存在，刷新列表即可看到。如需全量数据请勾选「全量历史数据」")
+            if exists:
+                st.info("该股票数据已存在，刷新列表即可看到。如需重新获取请点击下方按钮")
+                btn_label = "重新获取数据"
             else:
-                btn_label = "重新获取全量数据" if (exists and full_history) else "获取数据"
-                if st.button(btn_label, type="primary", use_container_width=True, key="fetch_new_btn"):
-                    with st.spinner(f"正在获取 {new_code} {'全量' if full_history else ''}数据..."):
-                        try:
-                            start_d = "19900101" if full_history else "20200101"
-                            max_d = 10000 if full_history else 500
-                            if exists and full_history:
-                                delete_stock_data(new_code)
-                            df, name, _ = fetch_and_store(new_code, start_date=start_d, max_days=max_d)
-                            st.session_state.stock_data = df
-                            st.session_state.stock_code = new_code
-                            st.session_state.stock_name = name
-                            st.session_state.train_results = None
-                            st.session_state.predictions = None
-                            st.success(f"获取成功: {name} ({len(df)} 条)")
-                            st.session_state.db_stocks = list_stocks_with_status()
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"获取失败: {e}")
+                btn_label = "获取数据"
+            if st.button(btn_label, type="primary", use_container_width=True, key="fetch_new_btn"):
+                with st.spinner(f"正在获取 {new_code} ({start_d} ~ {end_d}) 数据..."):
+                    try:
+                        if exists:
+                            delete_stock_data(new_code)
+                        df, name, _ = fetch_and_store(new_code, start_date=start_d,
+                                                       end_date=end_d, max_days=10000)
+                        st.session_state.stock_data = df
+                        st.session_state.stock_code = new_code
+                        st.session_state.stock_name = name
+                        st.session_state.train_results = None
+                        st.session_state.predictions = None
+                        st.success(f"获取成功: {name} ({len(df)} 条)")
+                        st.session_state.db_stocks = list_stocks_with_status()
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"获取失败: {e}")
 
     else:
         st.download_button(
