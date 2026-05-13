@@ -1,0 +1,600 @@
+"""
+涨跌方向预测 - 二分类模块
+========================
+独立于回归预测管线，使用 GARCH(1,1) 波动率作为核心特征，
+XGBoost + ElasticNet LogisticRegression 二分类器，
+严格扩展窗口时间序列验证，智能参数推荐。
+
+防泄漏保证:
+1. 仅使用扩展窗口 (expanding window) 划分，禁止随机 shuffle / k-fold
+2. GARCH(1,1) 条件波动率仅在各折训练集上拟合，验证集用前向预测
+3. 所有量价衍生特征（成交量变化率、相对成交量、量价配合度、放量上涨、缩量下跌）保留
+4. create_clf_features 对时刻 i 仅使用 [i-look_back, i-1] 的信息
+5. 目标变量 目标涨跌 = 涨跌标签.shift(-1)，预测的是下一日涨跌
+"""
+
+import time
+import warnings
+import numpy as np
+import pandas as pd
+from dataclasses import dataclass, field
+from typing import List, Tuple, Dict, Optional, Callable
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import roc_auc_score
+from scipy.stats import pearsonr
+
+from .features import compute_technical_indicators, time_series_split
+from .preprocessing import preprocess_data
+from .volatility import fit_garch
+
+warnings.filterwarnings("ignore")
+
+# ── 分类特征列（排除目标涨跌、目标收益率，保留所有量价衍生特征） ──
+
+CLF_FEATURE_COLS = [
+    # 基础价格 / 成交量
+    "close", "open", "high", "low", "volume",
+    # 技术指标（均线 / MACD / RSI / 布林带）
+    "ma5", "ma10", "ma20", "ma60",
+    "dif", "dea", "macd", "rsi",
+    "boll_upper", "boll_mid", "boll_lower",
+    # 涨跌幅
+    "pct_change",
+    # 成交量衍生（vol_ma5/ma20/obv/vol_ratio/vwap/vol_price_corr/vol_momentum）
+    "vol_ma5", "vol_ma20",
+    "obv", "vol_ratio", "vwap", "vol_price_corr", "vol_momentum",
+    # 收益率衍生（日收益率、日收益率_ma5）
+    "日收益率", "日收益率_ma5",
+    # preprocess_data 生成的量价配合特征（要求1: 保留量价衍生特征）
+    "成交量变化率", "相对成交量", "量价配合度",
+    "放量上涨", "缩量下跌",
+]
+
+
+# ── 数据容器 ──
+
+@dataclass
+class ClfResult:
+    """单分类器训练结果（所有字段对应 OOS 样本）"""
+    model_name: str
+    model_object: object = None
+    # OOS 预测与标签（按折拼接，时间顺序）
+    oos_probabilities: np.ndarray = field(default_factory=lambda: np.array([]))
+    oos_predictions: np.ndarray = field(default_factory=lambda: np.array([]))
+    oos_actuals: np.ndarray = field(default_factory=lambda: np.array([]))
+    oos_returns: np.ndarray = field(default_factory=lambda: np.array([]))
+    oos_dates: np.ndarray = field(default_factory=lambda: np.array([]))
+    # CV 指标
+    fold_metrics: dict = field(default_factory=dict)
+    overall_metrics: dict = field(default_factory=dict)
+    # 特征重要性（XGBoost 多折平均）
+    feature_importance: dict = field(default_factory=dict)
+    training_time: float = 0.0
+    feature_names: list = field(default_factory=list)
+
+
+# ── 特征工程 ──
+
+def create_clf_features(
+    df: pd.DataFrame,
+    feature_cols: List[str],
+    look_back: int,
+) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    """
+    构建分类滞后特征（严格防泄漏）。
+
+    对时刻 i，仅使用 [i-look_back, i-1] 的数据构造特征，
+    目标 y[i] = df.iloc[i]['目标涨跌'] 预测的是 i→i+1 的涨跌方向。
+
+    df: 已预处理的 DataFrame（需包含 目标涨跌 和 feature_cols 中所有列）
+    feature_cols: 用作特征的列名列表
+    look_back: 回溯天数
+
+    返回: (X, y, feature_names)
+      X: (n_samples, n_features * look_back) 原始值未归一化
+      y: (n_samples,) 0/1 标签
+      feature_names: "col_lagN" 格式的特征名
+    """
+    if "目标涨跌" not in df.columns:
+        raise ValueError("df 中缺少 '目标涨跌' 列，请先调用 preprocess_data()")
+
+    missing = [c for c in feature_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"df 中缺少以下特征列: {missing}")
+
+    # 只保留需要的列 + 目标
+    cols = feature_cols + ["目标涨跌"]
+    df_sub = df[cols].copy()
+    df_sub = df_sub.dropna()
+
+    if len(df_sub) <= look_back:
+        raise ValueError(f"有效数据量 {len(df_sub)} <= look_back {look_back}，无法构造特征")
+
+    n = len(df_sub)
+    X_list = []
+    for i in range(look_back, n):
+        # 仅使用 i-look_back 到 i-1 的数据，不含 i（防泄漏要求 4）
+        row = df_sub[feature_cols].iloc[i - look_back:i].values.flatten()
+        X_list.append(row)
+
+    X = np.array(X_list, dtype=np.float64)
+    y = df_sub["目标涨跌"].values[look_back:].astype(int)
+
+    # 构建特征名
+    feature_names = []
+    for col in feature_cols:
+        for lag in range(look_back, 0, -1):
+            feature_names.append(f"{col}_lag{lag}")
+
+    return X, y, feature_names
+
+
+# ── 模型构建 ──
+
+def build_xgb_classifier(params: dict):
+    """XGBoost 二分类器"""
+    import xgboost as xgb
+    return xgb.XGBClassifier(
+        n_estimators=params.get("n_estimators", 100),
+        max_depth=params.get("max_depth", 6),
+        learning_rate=params.get("learning_rate", 0.1),
+        subsample=params.get("subsample", 0.8),
+        objective="binary:logistic",
+        eval_metric="logloss",
+        random_state=42,
+        n_jobs=-1,
+        verbosity=0,
+    )
+
+
+def build_elasticnet(params: dict):
+    """ElasticNet LogisticRegression"""
+    return LogisticRegression(
+        C=params.get("C", 1.0),
+        l1_ratio=params.get("l1_ratio", 0.5),
+        penalty="elasticnet",
+        solver="saga",
+        max_iter=params.get("max_iter", 5000),
+        random_state=42,
+        n_jobs=-1,
+    )
+
+
+# ── GARCH 波动率特征（防泄漏） ──
+
+def _expanding_hist_vol(returns: np.ndarray, min_window: int = 20) -> np.ndarray:
+    """扩展窗口历史波动率（GARCH 失败时的回退方案）。
+    每一点仅使用该点之前的数据。"""
+    vol = np.zeros(len(returns))
+    for i in range(len(returns)):
+        w = max(i + 1, min_window)
+        vol[i] = np.std(returns[max(0, i - w + 1):i + 1])
+    return vol
+
+
+def _extract_garch_vol_from_model(garch_result) -> np.ndarray:
+    """从已拟合的 GARCH 模型提取条件波动率序列。
+    conditional_volatility[t] 是 GARCH 模型对时刻 t 的预测波动率，
+    基于 t-1 之前的信息——由 arch 库保证。"""
+    cond_vol = np.asarray(garch_result.conditional_volatility, dtype=np.float64)
+    # 处理 NaN（GARCH 初始化阶段可能产生）
+    mask = np.isnan(cond_vol)
+    if mask.any():
+        first_valid = cond_vol[~mask][0] if (~mask).any() else 0.01
+        cond_vol[mask] = first_valid
+    return cond_vol
+
+
+def _forecast_garch_vol(garch_result, horizon: int) -> np.ndarray:
+    """对未来 horizon 期前向预测 GARCH 波动率（仅使用训练集信息）。"""
+    try:
+        forecast = garch_result.forecast(horizon=horizon)
+        var_forecast = forecast.variance.iloc[-1].values
+        vol = np.sqrt(np.maximum(var_forecast, 0))
+        vol = np.nan_to_num(vol, nan=0.01)
+        return vol
+    except Exception:
+        return np.full(horizon, 0.01)
+
+
+# ── 评估指标 ──
+
+def calculate_classification_metrics(
+    y_true: np.ndarray,
+    y_pred_proba: np.ndarray,
+    returns: np.ndarray,
+    predictions: np.ndarray,
+) -> dict:
+    """
+    计算分类及策略指标。
+
+    策略逻辑: 预测涨(prob>=0.5)则做多(持有)，预测跌则空仓(收益=0)。
+
+    返回:
+      auc, ic, ic_pvalue,
+      cum_return, ann_return, sharpe, max_dd, win_rate,
+      accuracy, precision, recall, confusion
+    """
+    metrics = {}
+
+    # AUC
+    try:
+        unique = np.unique(y_true)
+        if len(unique) >= 2:
+            metrics["auc"] = float(roc_auc_score(y_true, y_pred_proba))
+        else:
+            metrics["auc"] = np.nan
+    except ValueError:
+        metrics["auc"] = np.nan
+
+    # IC: 预测概率与实际收益率的相关性
+    mask = ~(np.isnan(y_pred_proba) | np.isnan(returns))
+    if mask.sum() >= 10:
+        ic, ic_pv = pearsonr(y_pred_proba[mask], returns[mask])
+        metrics["ic"] = float(ic)
+        metrics["ic_pvalue"] = float(ic_pv)
+    else:
+        metrics["ic"] = np.nan
+        metrics["ic_pvalue"] = np.nan
+
+    # 策略收益: 预测涨做多(收益=实际收益)，预测跌空仓(收益=0)
+    n = len(predictions)
+    strategy_returns = returns[:n] * predictions
+    cum_series = np.cumprod(1 + strategy_returns)
+    cum_return = cum_series[-1] - 1
+    metrics["cum_return"] = float(cum_return)
+
+    # 年化收益（252 交易日）
+    if cum_return > -1 and n > 0:
+        metrics["ann_return"] = float((1 + cum_return) ** (252 / n) - 1)
+    else:
+        metrics["ann_return"] = -1.0
+
+    # Sharpe（无风险利率 = 0）
+    if np.std(strategy_returns) > 0 and n > 0:
+        metrics["sharpe"] = float(np.sqrt(252) * np.mean(strategy_returns) / np.std(strategy_returns))
+    else:
+        metrics["sharpe"] = 0.0
+
+    # 最大回撤
+    running_max = np.maximum.accumulate(cum_series)
+    drawdowns = (cum_series - running_max) / running_max
+    metrics["max_dd"] = float(drawdowns.min())
+
+    # 胜率（做多时的正确率）
+    long_mask = predictions == 1
+    if long_mask.sum() > 0:
+        metrics["win_rate"] = float((returns[:n][long_mask] > 0).mean())
+    else:
+        metrics["win_rate"] = 0.0
+
+    # 混淆矩阵
+    tp = int(((predictions == 1) & (y_true[:n] == 1)).sum())
+    tn = int(((predictions == 0) & (y_true[:n] == 0)).sum())
+    fp = int(((predictions == 1) & (y_true[:n] == 0)).sum())
+    fn = int(((predictions == 0) & (y_true[:n] == 1)).sum())
+    total = tp + tn + fp + fn
+    metrics["confusion"] = {"tp": tp, "tn": tn, "fp": fp, "fn": fn}
+    metrics["accuracy"] = (tp + tn) / total if total > 0 else 0.0
+    metrics["precision"] = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    metrics["recall"] = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+
+    return metrics
+
+
+# ── 扩展窗口训练引擎 ──
+
+def run_expanding_window(
+    X: np.ndarray,
+    y: np.ndarray,
+    returns: np.ndarray,
+    dates: np.ndarray,
+    feature_names: List[str],
+    models: List[str],
+    params: Dict[str, dict],
+    n_splits: int = 5,
+    min_train_size: int = 100,
+    progress_cb: Optional[Callable] = None,
+) -> Dict[str, ClfResult]:
+    """
+    严格扩展窗口时间序列训练 + 验证（禁止随机 shuffle / k-fold）。
+
+    每折:
+      - 训练集 = [:train_end]（含所有历史数据）
+      - 验证集 = [train_end:train_end+fold_size]（紧接训练集之后）
+      - GARCH(1,1) 仅在训练集上拟合 → training cond_vol（已由 arch 库保证无前视）
+      - 验证集 GARCH vol = 前向预测（仅使用训练集参数）
+
+    X, y, returns, dates: 已对齐的完整数据（由 create_clf_features 产出）
+    models: ["XGBoost", "ElasticNet"] 子集
+    params: {"XGBoost": {...}, "ElasticNet": {...}}
+
+    返回: {model_name: ClfResult}
+    """
+    results = {}
+
+    for model_name in models:
+        t0 = time.time()
+
+        result = ClfResult(model_name=model_name)
+        result.feature_names = feature_names + ["garch_vol"]
+
+        # 仅使用扩展窗口划分（要求 2+3）
+        splits = time_series_split(len(X), n_splits=n_splits, min_train_size=min_train_size)
+        if len(splits) == 0:
+            split_point = int(len(X) * 0.8)
+            splits = [(np.arange(split_point), np.arange(split_point, len(X)))]
+
+        all_oos_probs = []
+        all_oos_preds = []
+        all_oos_actuals = []
+        all_oos_returns = []
+        all_oos_dates = []
+        fold_metrics_list = []
+        fold_importances = []
+        fold_count = len(splits)
+
+        for fold_i, (train_idx, val_idx) in enumerate(splits):
+            if progress_cb:
+                pct = fold_i / fold_count
+                msg = f"[{model_name}] 折 {fold_i + 1}/{fold_count}"
+                progress_cb(pct, msg)
+
+            X_train = X[train_idx]
+            y_train = y[train_idx]
+            X_val = X[val_idx]
+            y_val = y[val_idx]
+            val_dates = dates[val_idx]
+            train_returns = returns[train_idx]
+            val_returns = returns[val_idx]
+
+            # ── A. 仅在训练集上拟合 GARCH（要求 4: 防未来信息泄漏） ──
+            garch_model = fit_garch(train_returns, p=1, q=1, dist='t')
+
+            if garch_model is not None:
+                garch_vol_train = _extract_garch_vol_from_model(garch_model)
+                garch_vol_val = _forecast_garch_vol(garch_model, len(val_idx))
+            else:
+                # GARCH 不收敛，回退为扩展历史波动率（仍仅用训练集）
+                garch_vol_train = _expanding_hist_vol(train_returns, min_window=20)
+                garch_vol_val = np.full(len(val_idx), np.std(train_returns[-60:]) if len(train_returns) >= 60 else np.std(train_returns))
+
+            # 长度对齐（GARCH 可能少返回首元素）
+            if len(garch_vol_train) < len(X_train):
+                pad_len = len(X_train) - len(garch_vol_train)
+                garch_vol_train = np.concatenate([np.full(pad_len, garch_vol_train[0]), garch_vol_train])
+            elif len(garch_vol_train) > len(X_train):
+                garch_vol_train = garch_vol_train[-len(X_train):]
+
+            garch_vol_train = np.nan_to_num(garch_vol_train, nan=0.01)
+            garch_vol_val = np.nan_to_num(garch_vol_val, nan=0.01)
+
+            X_train_aug = np.column_stack([X_train, garch_vol_train.reshape(-1, 1)])
+            X_val_aug = np.column_stack([X_val, garch_vol_val.reshape(-1, 1)])
+
+            # ── B. 训练 + 预测 ──
+            if model_name == "XGBoost":
+                clf = build_xgb_classifier(params.get(model_name, {}))
+                clf.fit(X_train_aug, y_train)
+                proba = clf.predict_proba(X_val_aug)[:, 1]
+                # 收集每折特征重要性（后续求平均）
+                fold_importances.append(dict(zip(
+                    feature_names + ["garch_vol"],
+                    clf.feature_importances_,
+                )))
+            elif model_name == "ElasticNet":
+                scaler = StandardScaler()
+                X_train_scaled = scaler.fit_transform(X_train_aug)
+                X_val_scaled = scaler.transform(X_val_aug)
+                clf = build_elasticnet(params.get(model_name, {}))
+                clf.fit(X_train_scaled, y_train)
+                proba = clf.predict_proba(X_val_scaled)[:, 1]
+            else:
+                raise ValueError(f"不支持的模型: {model_name}")
+
+            preds = (proba >= 0.5).astype(int)
+
+            all_oos_probs.append(proba)
+            all_oos_preds.append(preds)
+            all_oos_actuals.append(y_val)
+            all_oos_returns.append(val_returns)
+            all_oos_dates.append(val_dates)
+
+            # 折级指标
+            fold_metrics = calculate_classification_metrics(
+                y_val, proba, val_returns, preds
+            )
+            fold_metrics_list.append(fold_metrics)
+
+            result.model_object = clf
+
+        # ── 聚合 OOS（按时序拼接，非末 N 个） ──
+        result.oos_probabilities = np.concatenate(all_oos_probs)
+        result.oos_predictions = np.concatenate(all_oos_preds).astype(int)
+        result.oos_actuals = np.concatenate(all_oos_actuals).astype(int)
+        result.oos_returns = np.concatenate(all_oos_returns)
+        result.oos_dates = np.concatenate(all_oos_dates)
+
+        # 特征重要性：多折平均（XGBoost）
+        if fold_importances:
+            avg_imp = {}
+            for key in fold_importances[0]:
+                avg_imp[key] = float(np.mean([fi.get(key, 0) for fi in fold_importances]))
+            result.feature_importance = avg_imp
+
+        # 折级指标平均
+        if fold_metrics_list:
+            avg_metrics = {}
+            for key in fold_metrics_list[0]:
+                vals = [m[key] for m in fold_metrics_list
+                        if not (isinstance(m[key], float) and np.isnan(m[key]))]
+                if key == "confusion":
+                    avg_metrics[key] = {
+                        k: int(np.mean([m["confusion"][k] for m in fold_metrics_list]))
+                        for k in fold_metrics_list[0]["confusion"]
+                    }
+                elif vals:
+                    avg_metrics[key] = float(np.mean(vals))
+                else:
+                    avg_metrics[key] = np.nan
+            result.fold_metrics = {
+                "fold_scores": fold_metrics_list,
+                "cv_avg": avg_metrics,
+            }
+
+        # 全量 OOS 指标（使用正确对齐的 oos_returns）
+        result.overall_metrics = calculate_classification_metrics(
+            result.oos_actuals, result.oos_probabilities,
+            result.oos_returns, result.oos_predictions,
+        )
+
+        result.training_time = time.time() - t0
+        results[model_name] = result
+
+        if progress_cb:
+            progress_cb(1.0, f"[{model_name}] 完成 ({result.training_time:.1f}s)")
+
+    return results
+
+
+# ── 智能参数推荐 ──
+
+def get_recommended_params(n_samples: int, n_features: int = 30) -> dict:
+    """根据有效样本量返回推荐参数。4 档: tiny(<200) / small(200-500) / medium(500-1000) / large(>1000)"""
+    if n_samples < 200:
+        return {
+            "mode": "tiny",
+            "xgb": {"n_estimators": 50, "max_depth": 3, "learning_rate": 0.1, "subsample": 0.8},
+            "elasticnet": {"C": 10.0, "l1_ratio": 0.5, "max_iter": 5000},
+            "look_back": min(10, max(3, n_samples // 10)),
+            "n_splits": 3,
+        }
+    elif n_samples < 500:
+        return {
+            "mode": "small",
+            "xgb": {"n_estimators": 100, "max_depth": 4, "learning_rate": 0.05, "subsample": 0.8},
+            "elasticnet": {"C": 1.0, "l1_ratio": 0.3, "max_iter": 5000},
+            "look_back": min(15, max(5, n_samples // 15)),
+            "n_splits": 4,
+        }
+    elif n_samples < 1000:
+        return {
+            "mode": "medium",
+            "xgb": {"n_estimators": 200, "max_depth": 5, "learning_rate": 0.03, "subsample": 0.8},
+            "elasticnet": {"C": 0.5, "l1_ratio": 0.15, "max_iter": 5000},
+            "look_back": min(20, max(10, n_samples // 20)),
+            "n_splits": 5,
+        }
+    else:
+        return {
+            "mode": "large",
+            "xgb": {"n_estimators": 300, "max_depth": 6, "learning_rate": 0.01, "subsample": 0.8},
+            "elasticnet": {"C": 0.1, "l1_ratio": 0.05, "max_iter": 5000},
+            "look_back": min(30, max(15, n_samples // 25)),
+            "n_splits": 6,
+        }
+
+
+def check_params_deviation(current: Dict[str, dict], recommended: dict) -> List[str]:
+    """对比当前参数与推荐参数，返回警告列表。"""
+    warnings_list = []
+
+    xgb_cur = current.get("XGBoost", {})
+    xgb_rec = recommended.get("xgb", {})
+    for param, rec_val in xgb_rec.items():
+        cur_val = xgb_cur.get(param)
+        if cur_val is not None and cur_val != rec_val:
+            warnings_list.append(
+                f"XGBoost.{param}: 当前={cur_val}, 推荐={rec_val}"
+            )
+
+    en_cur = current.get("ElasticNet", {})
+    en_rec = recommended.get("elasticnet", {})
+    for param, rec_val in en_rec.items():
+        cur_val = en_cur.get(param)
+        if cur_val is not None and cur_val != rec_val:
+            warnings_list.append(
+                f"ElasticNet.{param}: 当前={cur_val}, 推荐={rec_val}"
+            )
+
+    return warnings_list
+
+
+# ── 完整管线 ──
+
+def run_classifier_pipeline(
+    df: pd.DataFrame,
+    selected_models: List[str],
+    params: Dict[str, dict],
+    look_back: int = 20,
+    n_splits: int = 5,
+    progress_cb: Optional[Callable] = None,
+) -> Dict[str, ClfResult]:
+    """
+    分类器完整管线。
+
+    1. preprocess_data → 日收益率 / 涨跌标签 / 目标涨跌 / 量价衍生特征
+    2. compute_technical_indicators → MA / MACD / RSI / 布林带 / OBV 等
+    3. create_clf_features → 滞后特征展平（严格防泄漏）
+    4. run_expanding_window → 扩展窗口训练+验证 + GARCH 注入
+
+    df: 原始 OHLCV DataFrame（index 为日期）
+    selected_models: ["XGBoost", "ElasticNet"] 子集
+    params: 每个模型的超参数字典
+    look_back: 特征回溯天数
+    n_splits: 扩展窗口折数
+    progress_cb: callable(pct, msg) 进度回调
+
+    返回: {model_name: ClfResult}
+    """
+    if progress_cb:
+        progress_cb(0.0, "数据预处理中...")
+
+    # 1. 预处理（添加 日收益率 / 涨跌标签 / 目标涨跌 / 成交量变化率 / 相对成交量 /
+    #    量价配合度 / 放量上涨 / 缩量下跌）
+    df_proc = preprocess_data(df)
+
+    # 2. 技术指标（添加 MA / MACD / RSI / 布林带 / OBV / vol_ma / vwap 等，
+    #    全部仅用历史数据，无前视）
+    df_ind = compute_technical_indicators(df_proc)
+
+    # 3. 筛选可用特征（仅保留 df 中实际存在的列）
+    available_features = [c for c in CLF_FEATURE_COLS if c in df_ind.columns]
+    if len(available_features) < 3:
+        raise ValueError(f"可用特征不足 ({len(available_features)})，请检查数据完整性")
+
+    if progress_cb:
+        progress_cb(0.1, "构造滞后特征...")
+
+    # 4. 构造特征和目标（X: 纯滞后特征, y: 目标涨跌）
+    X, y, feature_names = create_clf_features(df_ind, available_features, look_back)
+
+    # 5. 对齐 returns 和 dates（跳过前 look_back 天，与 create_clf_features 一致）
+    returns = df_ind["日收益率"].values[look_back:]
+    dates = df_ind.index[look_back:]
+
+    n_common = min(len(X), len(returns), len(dates))
+    X = X[:n_common]
+    y = y[:n_common]
+    returns = returns[:n_common]
+    dates = dates[:n_common]
+
+    if progress_cb:
+        progress_cb(0.15, f"有效样本: {len(X)} 行 × {len(feature_names)} 特征")
+
+    # 6. 扩展窗口训练 + 验证
+    results = run_expanding_window(
+        X=X, y=y, returns=returns, dates=dates,
+        feature_names=feature_names,
+        models=selected_models,
+        params=params,
+        n_splits=n_splits,
+        progress_cb=progress_cb,
+    )
+
+    if progress_cb:
+        progress_cb(1.0, "涨跌预测完成!")
+
+    return results

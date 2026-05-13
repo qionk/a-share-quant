@@ -25,6 +25,7 @@ from src.predict.data_input import (
     load_from_akshare, load_from_excel, generate_template, get_stock_name,
 )
 from src.predict.features import compute_technical_indicators, prepare_features, create_sequences
+from src.predict.preprocessing import preprocess_data
 from src.predict.models import ModelConfig
 from src.predict.training import (
     train_all_models, compute_ensemble_weights, ensemble_predict,
@@ -52,6 +53,10 @@ from src.predict.fibonacci_wave import (
 from src.predict.long_term_prediction import (
     resample_to_weekly, train_long_term_models,
     assess_risk, get_rating,
+)
+from src.predict.ensemble_classifier import (
+    run_classifier_pipeline, get_recommended_params,
+    check_params_deviation, CLF_FEATURE_COLS, create_clf_features,
 )
 from src.data import load_config
 
@@ -248,6 +253,27 @@ if "dl_learning_rate" not in st.session_state:
     st.session_state.dl_learning_rate = DL_LEARNING_RATE
 if "longterm_results" not in st.session_state:
     st.session_state.longterm_results = None
+
+# ── 涨跌预测模块状态 ──
+if "clf_results" not in st.session_state:
+    st.session_state.clf_results = None
+if "clf_params" not in st.session_state:
+    st.session_state.clf_params = {
+        "XGBoost": {"n_estimators": 100, "max_depth": 6, "learning_rate": 0.1, "subsample": 0.8},
+        "ElasticNet": {"C": 1.0, "l1_ratio": 0.5, "max_iter": 5000},
+    }
+if "clf_recommended_params" not in st.session_state:
+    st.session_state.clf_recommended_params = None
+if "clf_selected_models" not in st.session_state:
+    st.session_state.clf_selected_models = ["XGBoost", "ElasticNet"]
+if "clf_look_back" not in st.session_state:
+    st.session_state.clf_look_back = 20
+if "clf_n_splits" not in st.session_state:
+    st.session_state.clf_n_splits = 5
+if "clf_modified_models" not in st.session_state:
+    st.session_state.clf_modified_models = set()
+if "clf_training_active" not in st.session_state:
+    st.session_state.clf_training_active = False
 
 
 def _param_changed(model_name, key, value, default_val):
@@ -560,9 +586,74 @@ def garch_dialog():
     """)
     st.caption("GARCH模型用于波动率预测和风险指标计算")
 
+
+# ── 涨跌预测分类器参数对话框 ──
+
+@st.dialog("XGBoost 分类器参数设置")
+def clf_xgboost_dialog():
+    params = st.session_state.clf_params["XGBoost"]
+    defaults = {"n_estimators": 100, "max_depth": 6, "learning_rate": 0.1, "subsample": 0.8}
+
+    new_lr = st.slider("学习率", 0.01, 0.30, params.get("learning_rate", 0.1), 0.01, key="dg_clf_xgb_lr", format="%.2f")
+    new_n = st.slider("树数量", 10, 500, params.get("n_estimators", 100), 10, key="dg_clf_xgb_n")
+    new_md = st.slider("最大深度", 2, 12, params.get("max_depth", 6), 1, key="dg_clf_xgb_md")
+    new_ss = st.slider("子样本比例", 0.5, 1.0, params.get("subsample", 0.8), 0.05, key="dg_clf_xgb_ss")
+
+    c1, c2 = st.columns(2)
+    if c1.button("恢复默认", use_container_width=True, key="clf_xgb_reset"):
+        st.session_state.clf_params["XGBoost"] = dict(defaults)
+        st.session_state.clf_modified_models.discard("XGBoost")
+        st.rerun()
+    if c2.button("确认保存", use_container_width=True, type="primary", key="clf_xgb_save"):
+        st.session_state.clf_params["XGBoost"] = {
+            "n_estimators": new_n, "max_depth": new_md,
+            "learning_rate": new_lr, "subsample": new_ss}
+        all_default = all(
+            st.session_state.clf_params["XGBoost"].get(k) == defaults.get(k)
+            for k in defaults
+        )
+        if all_default:
+            st.session_state.clf_modified_models.discard("XGBoost")
+        else:
+            st.session_state.clf_modified_models.add("XGBoost")
+        st.rerun()
+
+
+@st.dialog("ElasticNet 分类器参数设置")
+def clf_elasticnet_dialog():
+    params = st.session_state.clf_params["ElasticNet"]
+    defaults = {"C": 1.0, "l1_ratio": 0.5, "max_iter": 5000}
+
+    new_C = st.slider("正则化强度 C (越小越强)", 0.01, 100.0, params.get("C", 1.0), 0.01,
+                      key="dg_clf_en_c", format="%.2f")
+    new_l1 = st.slider("L1比例", 0.0, 1.0, params.get("l1_ratio", 0.5), 0.05,
+                       key="dg_clf_en_l1")
+    new_mi = st.slider("最大迭代次数", 500, 10000, params.get("max_iter", 5000), 500,
+                       key="dg_clf_en_mi")
+
+    c1, c2 = st.columns(2)
+    if c1.button("恢复默认", use_container_width=True, key="clf_en_reset"):
+        st.session_state.clf_params["ElasticNet"] = dict(defaults)
+        st.session_state.clf_modified_models.discard("ElasticNet")
+        st.rerun()
+    if c2.button("确认保存", use_container_width=True, type="primary", key="clf_en_save"):
+        st.session_state.clf_params["ElasticNet"] = {
+            "C": new_C, "l1_ratio": new_l1, "max_iter": new_mi}
+        all_default = all(
+            st.session_state.clf_params["ElasticNet"].get(k) == defaults.get(k)
+            for k in defaults
+        )
+        if all_default:
+            st.session_state.clf_modified_models.discard("ElasticNet")
+        else:
+            st.session_state.clf_modified_models.add("ElasticNet")
+        st.rerun()
+
+
 # ═══════ 侧边栏 ═══════
 
 btn_train = False
+btn_clf_train = False
 
 with st.sidebar:
     st.header("配置参数")
@@ -803,6 +894,73 @@ with st.sidebar:
                               disabled=st.session_state.stock_data is None)
     btn_export = st.button("导出所有结果", use_container_width=True,
                            disabled=st.session_state.train_results is None)
+
+    # ── 涨跌预测设置 ──
+    st.divider()
+    st.subheader("涨跌预测设置")
+
+    clf_model_options = ["XGBoost", "ElasticNet"]
+    st.session_state.clf_selected_models = st.multiselect(
+        "分类模型", clf_model_options,
+        default=st.session_state.clf_selected_models,
+        help="XGBoost 二分类器 + ElasticNet LogisticRegression")
+
+    st.session_state.clf_look_back = st.slider(
+        "特征回溯天数", 1, 60, st.session_state.clf_look_back,
+        key="clf_look_back_slider",
+        help="每个样本使用过去 N 天的特征")
+
+    st.session_state.clf_n_splits = st.slider(
+        "扩展窗口折数", 3, 10, st.session_state.clf_n_splits,
+        key="clf_n_splits_slider",
+        help="时间序列扩展窗口验证的折数")
+
+    st.caption("分类器参数（🔵 = 已修改）")
+    c1, c2 = st.columns(2)
+    with c1:
+        mod_xgb = " 🔵" if "XGBoost" in st.session_state.clf_modified_models else ""
+        if st.button(f"⚙ XGBoost{mod_xgb}", key="set_clf_xgb", use_container_width=True):
+            clf_xgboost_dialog()
+    with c2:
+        mod_en = " 🔵" if "ElasticNet" in st.session_state.clf_modified_models else ""
+        if st.button(f"⚙ ElasticNet{mod_en}", key="set_clf_en", use_container_width=True):
+            clf_elasticnet_dialog()
+
+    # 智能推荐
+    st.divider()
+    btn_clf_recommend = st.button("智能推荐", key="clf_smart_recommend", use_container_width=True)
+    if btn_clf_recommend:
+        if st.session_state.stock_data is not None:
+            n_samples = len(st.session_state.stock_data)
+            n_features = len([c for c in CLF_FEATURE_COLS if c in st.session_state.stock_data.columns])
+            st.session_state.clf_recommended_params = get_recommended_params(n_samples, n_features)
+            st.toast(f"推荐模式: {st.session_state.clf_recommended_params['mode']}")
+
+            st.session_state.clf_params["XGBoost"] = dict(
+                st.session_state.clf_recommended_params["xgb"])
+            st.session_state.clf_params["ElasticNet"] = dict(
+                st.session_state.clf_recommended_params["elasticnet"])
+            st.session_state.clf_look_back = st.session_state.clf_recommended_params["look_back"]
+            st.session_state.clf_n_splits = st.session_state.clf_recommended_params["n_splits"]
+            st.rerun()
+        else:
+            st.warning("请先加载数据")
+
+    if st.session_state.clf_recommended_params is not None:
+        rec = st.session_state.clf_recommended_params
+        st.info(f"当前推荐: **{rec['mode']}** 模式 (样本数反馈)")
+        cur = st.session_state.clf_params
+        dev_warnings = check_params_deviation(cur, rec)
+        if dev_warnings:
+            for w in dev_warnings:
+                st.warning(w)
+
+    # 训练触发
+    if st.session_state.clf_training_active:
+        st.warning("涨跌预测训练中...")
+    else:
+        btn_clf_train = st.button("开始涨跌训练", type="primary", use_container_width=True,
+            disabled=st.session_state.stock_data is None or len(st.session_state.clf_selected_models) == 0)
 
 
 # ═══════ 构建 ModelConfig ═══════
@@ -1244,8 +1402,46 @@ def _chart_config(fig, height=None, title=None, xaxis_title=None, yaxis_title=No
     return fig
 
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
-    ["数据概览", "模型训练", "预测结果", "模型评估", "模型管理", "结果导出", "模型参数详情", "中长期预测"]
+# ═══════ 涨跌预测训练触发 ═══════
+
+if btn_clf_train and st.session_state.stock_data is not None:
+    st.session_state.clf_training_active = True
+
+    st.subheader("涨跌预测训练进度")
+    clf_progress_bar = st.progress(0, text="准备训练...")
+    clf_status = st.empty()
+
+    def clf_progress_cb(pct, msg):
+        clf_progress_bar.progress(min(pct, 1.0), text=msg)
+        clf_status.markdown(msg)
+
+    try:
+        clf_progress_cb(0.0, "数据预处理中...")
+
+        results = run_classifier_pipeline(
+            df=st.session_state.stock_data,
+            selected_models=st.session_state.clf_selected_models,
+            params=st.session_state.clf_params,
+            look_back=st.session_state.clf_look_back,
+            n_splits=st.session_state.clf_n_splits,
+            progress_cb=clf_progress_cb,
+        )
+
+        st.session_state.clf_results = results
+        clf_progress_bar.progress(1.0, text="涨跌预测训练完成!")
+        st.toast("涨跌预测训练完成!")
+
+    except Exception as e:
+        st.error(f"涨跌预测训练失败: {e}")
+        import traceback
+        st.code(traceback.format_exc())
+
+    st.session_state.clf_training_active = False
+    st.rerun()
+
+
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(
+    ["数据概览", "模型训练", "预测结果", "模型评估", "模型管理", "结果导出", "模型参数详情", "中长期预测", "涨跌预测"]
 )
 
 # ── Tab 1: 数据概览 ──────────────────────────────────────────
@@ -2236,6 +2432,196 @@ with tab8:
                 st.info("LightGBM 未训练或无法获取特征重要性")
     else:
         st.info("请先在侧边栏加载数据")
+
+
+# ── Tab 9: 涨跌预测 ──────────────────────────────────────────
+
+with tab9:
+    if st.session_state.clf_results is not None:
+        results = st.session_state.clf_results
+
+        st.subheader("涨跌预测结果")
+
+        # ── 指标卡 ──
+        for model_name in st.session_state.clf_selected_models:
+            if model_name not in results:
+                continue
+            r = results[model_name]
+            m = r.overall_metrics
+
+            st.markdown(f"### {model_name}")
+            mc1, mc2, mc3, mc4, mc5, mc6 = st.columns(6)
+            mc1.metric("AUC", f"{m.get('auc', 0):.3f}")
+            mc2.metric("IC", f"{m.get('ic', 0):.3f}" if not np.isnan(m.get('ic', np.nan)) else "N/A")
+            mc3.metric("年化收益", f"{m.get('ann_return', 0)*100:+.2f}%")
+            mc4.metric("Sharpe", f"{m.get('sharpe', 0):.2f}")
+            mc5.metric("最大回撤", f"{m.get('max_dd', 0)*100:.2f}%")
+            mc6.metric("胜率", f"{m.get('win_rate', 0)*100:.1f}%")
+
+            # 混淆矩阵
+            with st.expander("混淆矩阵 & 分类指标", expanded=False):
+                cm = m.get("confusion", {})
+                cm_df = pd.DataFrame({
+                    "预测涨": [cm.get('tp', 0), cm.get('fp', 0)],
+                    "预测跌": [cm.get('fn', 0), cm.get('tn', 0)],
+                }, index=["实际涨", "实际跌"])
+                st.dataframe(cm_df, use_container_width=True)
+                st.caption(
+                    f"准确率: {m.get('accuracy', 0)*100:.1f}% | "
+                    f"精确率: {m.get('precision', 0)*100:.1f}% | "
+                    f"召回率: {m.get('recall', 0)*100:.1f}%")
+
+            # 折级指标
+            if r.fold_metrics.get("cv_avg"):
+                cv = r.fold_metrics["cv_avg"]
+                with st.expander("交叉验证平均指标", expanded=False):
+                    cv_rows = [{
+                        "指标": k,
+                        "CV均值": f"{v:.4f}" if not isinstance(v, dict) else str(v)
+                    } for k, v in cv.items() if k != "confusion"]
+                    if cv_rows:
+                        st.dataframe(pd.DataFrame(cv_rows), use_container_width=True, hide_index=True)
+
+        # ── 累积收益曲线 ──
+        st.subheader("策略累积收益曲线")
+        st.caption("策略: 预测涨则做多，预测跌则空仓 | 基准: 买入持有")
+
+        fig_cum = go.Figure()
+
+        if st.session_state.stock_data is not None and len(st.session_state.clf_selected_models) > 0:
+            # 取第一个模型的 OOS returns/dates 作为公共基准
+            first_model = st.session_state.clf_selected_models[0]
+            if first_model in results:
+                base_returns = results[first_model].oos_returns
+                base_dates = results[first_model].oos_dates
+
+                # 买入持有基准
+                bh_cum = np.cumprod(1 + base_returns) - 1
+                fig_cum.add_trace(go.Scatter(
+                    x=base_dates, y=bh_cum * 100,
+                    name="买入持有", line=dict(color="gray", dash="dash", width=1.5),
+                    mode="lines"))
+
+                # 模型策略
+                colors = {"XGBoost": "#1f77b4", "ElasticNet": "#ff7f0e"}
+                for model_name in st.session_state.clf_selected_models:
+                    if model_name not in results:
+                        continue
+                    r = results[model_name]
+                    strategy_ret = r.oos_returns * r.oos_predictions
+                    strategy_cum = np.cumprod(1 + strategy_ret) - 1
+
+                    fig_cum.add_trace(go.Scatter(
+                        x=r.oos_dates, y=strategy_cum * 100,
+                        name=f"{model_name} 策略", mode="lines",
+                        line=dict(color=colors.get(model_name, "#333"), width=2)))
+
+        fig_cum.update_layout(
+            height=450, title="累积收益率: 策略 vs 买入持有",
+            xaxis_title="日期", yaxis_title="累积收益率(%)",
+            hovermode="x unified",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02))
+        st.plotly_chart(fig_cum, use_container_width=True)
+
+        # ── 特征重要性 ──
+        if "XGBoost" in results and results["XGBoost"].feature_importance:
+            st.subheader("特征重要性 (XGBoost)")
+            imp = results["XGBoost"].feature_importance
+            sorted_imp = sorted(imp.items(), key=lambda x: abs(x[1]), reverse=True)[:15]
+            show_names = [k[:40] for k, _ in sorted_imp]
+            show_vals = [v for _, v in sorted_imp]
+
+            fig_imp = go.Figure(go.Bar(
+                x=show_vals, y=show_names, orientation="h",
+                marker_color="#1f77b4",
+            ))
+            fig_imp.update_layout(
+                height=400, title="Top 15 特征重要性",
+                xaxis_title="重要性", yaxis_title="特征")
+            st.plotly_chart(fig_imp, use_container_width=True)
+
+        # ── 近期预测明细表 ──
+        st.subheader("近期预测明细")
+        n_recent = st.slider("显示最近 N 天", 10, 60, 30, key="clf_recent_n")
+
+        # 使用第一个模型的 OOS 日期/收益作为基准
+        first_model = st.session_state.clf_selected_models[0]
+        if first_model in results:
+            base_dates = results[first_model].oos_dates
+            base_returns = results[first_model].oos_returns
+            # 取最近 n_recent 天
+            n_show = min(n_recent, len(base_dates))
+            recent_dates = base_dates[-n_show:]
+
+            table_data = []
+            for i in range(n_show):
+                idx = -(n_show - i)
+                d = recent_dates[i]
+                actual_return = base_returns[idx]
+                actual_dir = "涨" if actual_return > 0 else "跌"
+
+                row = {
+                    "日期": pd.Timestamp(d).strftime("%Y-%m-%d") if hasattr(pd.Timestamp(d), 'strftime') else str(d)[:10],
+                    "实际": actual_dir,
+                    "实际收益率": f"{actual_return*100:+.2f}%",
+                }
+
+                for model_name in st.session_state.clf_selected_models:
+                    if model_name not in results:
+                        continue
+                    r = results[model_name]
+                    idx_m = min(idx, len(r.oos_probabilities) - 1) if idx < 0 else min(idx, len(r.oos_probabilities) - 1)
+                    prob = r.oos_probabilities[idx_m]
+                    pred_dir = "涨" if prob >= 0.5 else "跌"
+                    correct = "✓" if (prob >= 0.5) == (actual_return > 0) else "✗"
+                    row[f"{model_name}"] = f"{prob:.3f} ({pred_dir}{correct})"
+
+                table_data.append(row)
+
+            st.dataframe(pd.DataFrame(table_data), use_container_width=True, hide_index=True)
+
+        # ── 导出 ──
+        st.subheader("导出预测结果")
+        # 使用第一个模型的 OOS 日期/收益作为导出基准
+        if first_model in results:
+            base_dates = results[first_model].oos_dates
+            base_returns = results[first_model].oos_returns
+            n_total = len(base_dates)
+
+            export_rows = []
+            for i in range(n_total):
+                row = {
+                    "日期": pd.Timestamp(base_dates[i]).strftime("%Y-%m-%d") if hasattr(pd.Timestamp(base_dates[i]), 'strftime') else str(base_dates[i])[:10],
+                    "实际收益率": round(float(base_returns[i]), 6),
+                    "实际涨跌": "涨" if base_returns[i] > 0 else "跌",
+                }
+                for model_name in st.session_state.clf_selected_models:
+                    if model_name not in results:
+                        continue
+                    r = results[model_name]
+                    if i < len(r.oos_probabilities):
+                        row[f"{model_name}_概率"] = round(float(r.oos_probabilities[i]), 4)
+                        row[f"{model_name}_预测"] = "涨" if r.oos_predictions[i] == 1 else "跌"
+                export_rows.append(row)
+
+            export_df = pd.DataFrame(export_rows)
+            csv = export_df.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                "下载预测结果 CSV",
+                data=csv,
+                file_name=f"clf_predictions_{st.session_state.stock_code}_{datetime.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+    else:
+        st.info("请在侧边栏「涨跌预测设置」中点击「开始涨跌训练」按钮")
+        if st.session_state.stock_data is not None:
+            n = len(st.session_state.stock_data)
+            n_features = len([c for c in CLF_FEATURE_COLS if c in st.session_state.stock_data.columns])
+            rec = get_recommended_params(n, n_features)
+            st.markdown(f"**当前数据量**: {n} 天, **可用特征**: {n_features} 个")
+            st.info(f"推荐训练模式: **{rec['mode']}** (回溯: {rec['look_back']}天, 折数: {rec['n_splits']})")
 
 
 # ═══════ 导出按钮处理 ═══════
