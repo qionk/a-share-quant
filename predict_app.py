@@ -1595,40 +1595,14 @@ if btn_clf_autotune and st.session_state.stock_data is not None:
             trial_cb=_tune_trial_cb,
         )
 
-        if tune_result["best_params"] is not None:
-            bp = tune_result["best_params"]
-            st.session_state.clf_look_back = bp["look_back"]
-            st.session_state.clf_forecast_days = bp["forecast_days"]
-            st.session_state.clf_n_splits = bp["n_splits"]
-            # 同步 widget key，确保 rerun 后 UI 显示新值
-            st.session_state.clf_look_back_slider = bp["look_back"]
-            st.session_state.clf_forecast_days_slider = bp["forecast_days"]
-            st.session_state.clf_n_splits_slider = bp["n_splits"]
-            st.session_state.clf_params["XGBoost"] = {
-                "learning_rate": bp["xgb_learning_rate"],
-                "n_estimators": bp["xgb_n_estimators"],
-                "max_depth": bp["xgb_max_depth"],
-                "subsample": bp["xgb_subsample"],
-                "colsample_bytree": bp["xgb_colsample_bytree"],
-                "min_child_weight": bp["xgb_min_child_weight"],
-                "reg_alpha": bp["xgb_reg_alpha"],
-                "reg_lambda": bp["xgb_reg_lambda"],
-            }
-            st.session_state.clf_params["ElasticNet"] = {
-                "C": bp["en_C"],
-                "l1_ratio": bp["en_l1_ratio"],
-                "max_iter": 5000,
-                "tol": 1e-3,
-            }
-
-            if tune_result["found"]:
-                st.toast(f"找到 AUC={tune_result['best_auc']:.2%} 的参数！已自动填入。")
-            else:
-                st.toast(f"最佳 AUC={tune_result['best_auc']:.2%}，未达标但已填入。")
+        _tune_progress.progress(1.0, text="调参完成!")
+        st.session_state.clf_autotune_results = tune_result.get("trials")
+        if tune_result["found"]:
+            st.success(f"找到 AUC={tune_result['best_auc']:.2%} 的参数组合！请在下方选择要应用的参数。")
+        elif tune_result["best_params"]:
+            st.warning(f"最佳 AUC={tune_result['best_auc']:.2%}，未达标。可选择下方任一组参数应用。")
         else:
             st.error("所有试验均失败，请检查数据。")
-
-        st.session_state.clf_autotune_results = tune_result.get("trials")
 
     except Exception as e:
         st.error(f"自动调参失败: {e}")
@@ -1636,7 +1610,6 @@ if btn_clf_autotune and st.session_state.stock_data is not None:
         st.code(traceback.format_exc())
 
     st.session_state.clf_autotune_active = False
-    st.rerun()
 
 
 # ═══════ 涨跌预测贝叶斯调参执行 ═══════
@@ -1676,39 +1649,14 @@ if btn_clf_optuna and st.session_state.stock_data is not None:
             trial_cb=_optuna_trial_cb,
         )
 
-        if tune_result["best_params"] is not None:
-            bp = tune_result["best_params"]
-            st.session_state.clf_look_back = bp["look_back"]
-            st.session_state.clf_forecast_days = bp["forecast_days"]
-            st.session_state.clf_n_splits = bp["n_splits"]
-            st.session_state.clf_look_back_slider = bp["look_back"]
-            st.session_state.clf_forecast_days_slider = bp["forecast_days"]
-            st.session_state.clf_n_splits_slider = bp["n_splits"]
-            st.session_state.clf_params["XGBoost"] = {
-                "learning_rate": bp["xgb_learning_rate"],
-                "n_estimators": bp["xgb_n_estimators"],
-                "max_depth": bp["xgb_max_depth"],
-                "subsample": bp["xgb_subsample"],
-                "colsample_bytree": bp["xgb_colsample_bytree"],
-                "min_child_weight": bp["xgb_min_child_weight"],
-                "reg_alpha": bp["xgb_reg_alpha"],
-                "reg_lambda": bp["xgb_reg_lambda"],
-            }
-            st.session_state.clf_params["ElasticNet"] = {
-                "C": bp["en_C"],
-                "l1_ratio": bp["en_l1_ratio"],
-                "max_iter": 5000,
-                "tol": 1e-3,
-            }
-
-            if tune_result["found"]:
-                st.toast(f"贝叶斯找到 AUC={tune_result['best_auc']:.2%} 的参数！已自动填入。")
-            else:
-                st.toast(f"最佳 AUC={tune_result['best_auc']:.2%}，未达标但已填入。")
+        _opt_progress.progress(1.0, text="调参完成!")
+        st.session_state.clf_autotune_results = tune_result.get("trials")
+        if tune_result["found"]:
+            st.success(f"贝叶斯优化找到 AUC={tune_result['best_auc']:.2%} 的参数组合！请在下方选择要应用的参数。")
+        elif tune_result["best_params"]:
+            st.warning(f"最佳 AUC={tune_result['best_auc']:.2%}，未达标。可选择下方任一组参数应用。")
         else:
             st.error("所有试验均失败，请检查数据。")
-
-        st.session_state.clf_autotune_results = tune_result.get("trials")
 
     except ImportError:
         st.error("需要安装 optuna: `pip install optuna`")
@@ -1718,7 +1666,74 @@ if btn_clf_optuna and st.session_state.stock_data is not None:
         st.code(traceback.format_exc())
 
     st.session_state.clf_autotune_active = False
-    st.rerun()
+
+
+# ═══════ 调参结果展示 + 参数应用 ═══════
+
+if st.session_state.clf_autotune_results:
+    st.subheader("调参结果")
+    _at_results = st.session_state.clf_autotune_results
+    # 按 AUC 降序排列展示
+    _at_sorted = sorted(_at_results, key=lambda x: x["auc"], reverse=True)
+
+    _at_display = []
+    for i, r in enumerate(_at_sorted):
+        _at_display.append({
+            "排名": i + 1,
+            "AUC": f"{r['auc']:.4f}",
+            "look_back": r["look_back"],
+            "forecast": r["forecast_days"],
+            "n_splits": r["n_splits"],
+            "lr": r["lr"],
+            "depth": r["depth"],
+            "n_est": r["n_est"],
+            "耗时(s)": r["elapsed"],
+        })
+    st.dataframe(pd.DataFrame(_at_display), use_container_width=True, hide_index=True)
+
+    # 让用户选择要应用哪组
+    _at_options = [f"第{i+1}名 | AUC={r['auc']:.4f} | lb={r['look_back']} fd={r['forecast_days']}" for i, r in enumerate(_at_sorted)]
+    _at_col1, _at_col2 = st.columns([3, 1])
+    with _at_col1:
+        _at_choice = st.selectbox("选择要应用的参数组", _at_options, key="clf_autotune_choice")
+    with _at_col2:
+        st.write("")
+        st.write("")
+        _at_apply = st.button("应用参数", key="btn_apply_tune", type="primary")
+
+    if _at_apply:
+        _chosen_idx = _at_options.index(_at_choice)
+        _chosen = _at_sorted[_chosen_idx]
+        bp = _chosen["sample"]
+        st.session_state.clf_look_back = bp["look_back"]
+        st.session_state.clf_forecast_days = bp["forecast_days"]
+        st.session_state.clf_n_splits = bp["n_splits"]
+        st.session_state.clf_look_back_slider = bp["look_back"]
+        st.session_state.clf_forecast_days_slider = bp["forecast_days"]
+        st.session_state.clf_n_splits_slider = bp["n_splits"]
+        st.session_state.clf_params["XGBoost"] = {
+            "learning_rate": bp["xgb_learning_rate"],
+            "n_estimators": bp["xgb_n_estimators"],
+            "max_depth": bp["xgb_max_depth"],
+            "subsample": bp["xgb_subsample"],
+            "colsample_bytree": bp["xgb_colsample_bytree"],
+            "min_child_weight": bp["xgb_min_child_weight"],
+            "reg_alpha": bp["xgb_reg_alpha"],
+            "reg_lambda": bp["xgb_reg_lambda"],
+        }
+        st.session_state.clf_params["ElasticNet"] = {
+            "C": bp["en_C"],
+            "l1_ratio": bp["en_l1_ratio"],
+            "max_iter": 5000,
+            "tol": 1e-3,
+        }
+        st.session_state.clf_autotune_results = None
+        st.toast(f"已应用第{_chosen_idx+1}名参数 (AUC={_chosen['auc']:.4f})")
+        st.rerun()
+
+    if st.button("清除调参结果", key="btn_clear_tune"):
+        st.session_state.clf_autotune_results = None
+        st.rerun()
 
 
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(
