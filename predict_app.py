@@ -1708,9 +1708,9 @@ if st.session_state.clf_autotune_results:
         st.session_state.clf_look_back = bp["look_back"]
         st.session_state.clf_forecast_days = bp["forecast_days"]
         st.session_state.clf_n_splits = bp["n_splits"]
-        st.session_state.clf_look_back_slider = bp["look_back"]
-        st.session_state.clf_forecast_days_slider = bp["forecast_days"]
-        st.session_state.clf_n_splits_slider = bp["n_splits"]
+        # 删除 widget key，rerun 后 widget 会用新 value 初始化
+        for _wk in ["clf_look_back_slider", "clf_forecast_days_slider", "clf_n_splits_slider"]:
+            st.session_state.pop(_wk, None)
         st.session_state.clf_params["XGBoost"] = {
             "learning_rate": bp["xgb_learning_rate"],
             "n_estimators": bp["xgb_n_estimators"],
