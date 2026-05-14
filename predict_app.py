@@ -291,6 +291,8 @@ if "clf_autotune_active" not in st.session_state:
     st.session_state.clf_autotune_active = False
 if "clf_autotune_results" not in st.session_state:
     st.session_state.clf_autotune_results = None
+if "_clf_tune_train_active" not in st.session_state:
+    st.session_state._clf_tune_train_active = False
 
 
 def _param_changed(model_name, key, value, default_val):
@@ -686,6 +688,7 @@ btn_train = False
 btn_clf_train = False
 btn_clf_autotune = False
 btn_clf_optuna = False
+btn_clf_parallel = False
 
 with st.sidebar:
     st.header("配置参数")
@@ -1037,7 +1040,7 @@ with st.sidebar:
         value=0.53, step=0.01, format="%.2f", key="clf_target_auc")
     _at_c1, _at_c2 = st.columns(2)
     with _at_c1:
-        clf_max_trials = st.number_input("随机次数", min_value=5, max_value=100,
+        clf_max_trials = st.number_input("随机/并行次数", min_value=5, max_value=100,
             value=30, step=5, key="clf_max_trials")
     with _at_c2:
         clf_max_trials_optuna = st.number_input("贝叶斯次数", min_value=5, max_value=100,
@@ -1048,6 +1051,8 @@ with st.sidebar:
             disabled=st.session_state.stock_data is None or st.session_state.clf_autotune_active)
     with _at_b2:
         btn_clf_optuna = st.button("智能调参(贝叶斯)", key="btn_clf_optuna", use_container_width=True,
+        disabled=st.session_state.stock_data is None or st.session_state.clf_autotune_active)
+    btn_clf_parallel = st.button("⚡ 并行调参 (多核加速)", key="btn_clf_parallel", use_container_width=True,
         disabled=st.session_state.stock_data is None or st.session_state.clf_autotune_active)
 
 
@@ -1494,14 +1499,14 @@ def _chart_config(fig, height=None, title=None, xaxis_title=None, yaxis_title=No
 
 if btn_clf_train and st.session_state.stock_data is not None:
     st.session_state.clf_training_active = True
+    st.session_state.clf_results = None
+    st.session_state.clf_ensemble_result = None
 
     st.subheader("涨跌预测训练进度")
     clf_progress_bar = st.progress(0, text="准备训练...")
-    clf_status = st.empty()
 
     def clf_progress_cb(pct, msg):
         clf_progress_bar.progress(min(pct, 1.0), text=msg)
-        clf_status.markdown(msg)
 
     try:
         clf_progress_cb(0.0, "数据预处理中...")
@@ -1668,14 +1673,171 @@ if btn_clf_optuna and st.session_state.stock_data is not None:
     st.session_state.clf_autotune_active = False
 
 
+# ═══════ 涨跌预测并行调参执行 ═══════
+
+if btn_clf_parallel and st.session_state.stock_data is not None:
+    st.session_state.clf_autotune_active = True
+    from src.predict.ensemble_classifier import auto_tune_parallel
+
+    st.subheader("并行调参 (多核加速)")
+    _par_progress = st.progress(0, text="准备中...")
+    _par_table_placeholder = st.empty()
+    _par_all_trials = []
+
+    def _parallel_batch_cb(completed, total, batch_results):
+        _par_progress.progress(completed / total, text=f"已完成 {completed}/{total} | 本批 {len(batch_results)} 个有效结果")
+        for r in batch_results:
+            _par_all_trials.append({
+                "#": r["trial"],
+                "look_back": r["look_back"],
+                "forecast": r["forecast_days"],
+                "n_splits": r["n_splits"],
+                "lr": r["lr"],
+                "depth": r["depth"],
+                "n_est": r["n_est"],
+                "AUC": f"{r['auc']:.4f}",
+                "耗时(s)": r["elapsed"],
+            })
+        _par_table_placeholder.dataframe(
+            pd.DataFrame(_par_all_trials), use_container_width=True, hide_index=True)
+
+    try:
+        import os
+        _n_cores = min(4, os.cpu_count() or 4)
+        st.caption(f"使用 {_n_cores} 个进程并行，每批 {_n_cores} 组参数同时训练")
+
+        tune_result = auto_tune_parallel(
+            df=st.session_state.stock_data,
+            stock_code=st.session_state.stock_code,
+            target_auc=clf_target_auc,
+            max_trials=int(clf_max_trials),
+            selected_models=st.session_state.clf_selected_models,
+            n_jobs=_n_cores,
+            batch_cb=_parallel_batch_cb,
+        )
+
+        _par_progress.progress(1.0, text="调参完成!")
+        st.session_state.clf_autotune_results = tune_result.get("trials")
+        if tune_result["found"]:
+            st.success(f"并行调参找到 AUC={tune_result['best_auc']:.2%} 的参数组合！请在下方选择要应用的参数。")
+        elif tune_result["best_params"]:
+            st.warning(f"最佳 AUC={tune_result['best_auc']:.2%}，未达标。可选择下方任一组参数应用。")
+        else:
+            st.error("所有试验均失败，请检查数据。")
+
+    except Exception as e:
+        st.error(f"并行调参失败: {e}")
+        import traceback
+        st.code(traceback.format_exc())
+
+    st.session_state.clf_autotune_active = False
+
+
 # ═══════ 调参结果展示 + 参数应用 ═══════
 
-if st.session_state.clf_autotune_results:
-    st.subheader("调参结果")
+_tune_train_active = st.session_state.get("_clf_tune_train_active", False)
+
+if _tune_train_active and st.session_state.stock_data is not None:
+    # 训练模式：只显示进度，不渲染选择控件
+    _at_results = st.session_state.clf_autotune_results or []
+    _at_sorted = sorted(_at_results, key=lambda x: x["auc"], reverse=True)
+    _chosen_idx = st.session_state.get("_clf_tune_chosen_idx", 0)
+    _chosen = _at_sorted[_chosen_idx]
+    bp = _chosen["sample"]
+
+    _tune_params = {
+        "XGBoost": {
+            "learning_rate": bp["xgb_learning_rate"],
+            "n_estimators": bp["xgb_n_estimators"],
+            "max_depth": bp["xgb_max_depth"],
+            "subsample": bp["xgb_subsample"],
+            "colsample_bytree": bp["xgb_colsample_bytree"],
+            "min_child_weight": bp["xgb_min_child_weight"],
+            "reg_alpha": bp["xgb_reg_alpha"],
+            "reg_lambda": bp["xgb_reg_lambda"],
+        },
+        "ElasticNet": {
+            "C": bp["en_C"],
+            "l1_ratio": bp["en_l1_ratio"],
+            "max_iter": 5000,
+            "tol": 1e-3,
+        },
+    }
+
+    st.session_state.clf_results = None
+    st.session_state.clf_ensemble_result = None
+
+    st.subheader("涨跌预测训练进度")
+    _tune_train_progress = st.progress(0, text="准备训练...")
+
+    def _tune_train_cb(pct, msg):
+        _tune_train_progress.progress(min(pct, 1.0), text=msg)
+
+    try:
+        _tune_train_cb(0.0, "数据预处理中...")
+        from src.predict.ensemble_classifier import run_classifier_pipeline
+
+        results, ensemble_result = run_classifier_pipeline(
+            df=st.session_state.stock_data,
+            selected_models=st.session_state.clf_selected_models,
+            params=_tune_params,
+            look_back=bp["look_back"],
+            n_splits=bp["n_splits"],
+            progress_cb=_tune_train_cb,
+            forecast_days=bp["forecast_days"],
+            threshold=st.session_state.clf_threshold,
+            stock_code=st.session_state.stock_code,
+        )
+
+        st.session_state.clf_results = results
+        st.session_state.clf_ensemble_result = ensemble_result
+        st.session_state.clf_results_stock_code = st.session_state.stock_code
+
+        st.session_state.clf_look_back = bp["look_back"]
+        st.session_state.clf_forecast_days = bp["forecast_days"]
+        st.session_state.clf_n_splits = bp["n_splits"]
+        st.session_state.clf_params = _tune_params
+        for _wk in ["clf_look_back_slider", "clf_forecast_days_slider", "clf_n_splits_slider"]:
+            st.session_state.pop(_wk, None)
+
+        try:
+            from src.predict.clf_history_store import save_clf_session
+            _clf_stock_code = st.session_state.stock_code
+            _clf_stock_name = st.session_state.get("stock_name", _clf_stock_code)
+            save_clf_session(
+                _clf_stock_code, _clf_stock_name,
+                {
+                    "forecast_days": bp["forecast_days"],
+                    "threshold": st.session_state.clf_threshold,
+                    "look_back": bp["look_back"],
+                    "n_splits": bp["n_splits"],
+                    "selected_models": st.session_state.clf_selected_models,
+                    "params": _tune_params,
+                    "results": results,
+                    "ensemble_result": ensemble_result,
+                    "data_dates": (st.session_state.stock_data.index[0], st.session_state.stock_data.index[-1]),
+                },
+            )
+        except Exception:
+            pass
+
+        _tune_train_progress.progress(1.0, text="训练完成!")
+        st.toast(f"训练完成! 使用第{_chosen_idx+1}名参数 (AUC={_chosen['auc']:.4f})")
+
+    except Exception as e:
+        st.error(f"训练失败: {e}")
+        import traceback
+        st.code(traceback.format_exc())
+
+    st.session_state._clf_tune_train_active = False
+    st.session_state.clf_autotune_results = None
+    st.rerun()
+
+elif st.session_state.clf_autotune_results:
     _at_results = st.session_state.clf_autotune_results
-    # 按 AUC 降序排列展示
     _at_sorted = sorted(_at_results, key=lambda x: x["auc"], reverse=True)
 
+    st.subheader("调参结果")
     _at_display = []
     for i, r in enumerate(_at_sorted):
         _at_display.append({
@@ -1691,48 +1853,22 @@ if st.session_state.clf_autotune_results:
         })
     st.dataframe(pd.DataFrame(_at_display), use_container_width=True, hide_index=True)
 
-    # 让用户选择要应用哪组
     _at_options = [f"第{i+1}名 | AUC={r['auc']:.4f} | lb={r['look_back']} fd={r['forecast_days']}" for i, r in enumerate(_at_sorted)]
-    _at_col1, _at_col2 = st.columns([3, 1])
-    with _at_col1:
-        _at_choice = st.selectbox("选择要应用的参数组", _at_options, key="clf_autotune_choice")
-    with _at_col2:
-        st.write("")
-        st.write("")
-        _at_apply = st.button("应用参数", key="btn_apply_tune", type="primary")
+    _at_choice = st.selectbox("选择参数组", _at_options, key="clf_autotune_choice")
 
-    if _at_apply:
-        _chosen_idx = _at_options.index(_at_choice)
-        _chosen = _at_sorted[_chosen_idx]
-        bp = _chosen["sample"]
-        st.session_state.clf_look_back = bp["look_back"]
-        st.session_state.clf_forecast_days = bp["forecast_days"]
-        st.session_state.clf_n_splits = bp["n_splits"]
-        # 删除 widget key，rerun 后 widget 会用新 value 初始化
-        for _wk in ["clf_look_back_slider", "clf_forecast_days_slider", "clf_n_splits_slider"]:
-            st.session_state.pop(_wk, None)
-        st.session_state.clf_params["XGBoost"] = {
-            "learning_rate": bp["xgb_learning_rate"],
-            "n_estimators": bp["xgb_n_estimators"],
-            "max_depth": bp["xgb_max_depth"],
-            "subsample": bp["xgb_subsample"],
-            "colsample_bytree": bp["xgb_colsample_bytree"],
-            "min_child_weight": bp["xgb_min_child_weight"],
-            "reg_alpha": bp["xgb_reg_alpha"],
-            "reg_lambda": bp["xgb_reg_lambda"],
-        }
-        st.session_state.clf_params["ElasticNet"] = {
-            "C": bp["en_C"],
-            "l1_ratio": bp["en_l1_ratio"],
-            "max_iter": 5000,
-            "tol": 1e-3,
-        }
+    _at_btn_col1, _at_btn_col2 = st.columns([1, 1])
+    with _at_btn_col1:
+        _at_train = st.button("使用该参数开始训练", key="btn_tune_train", type="primary", use_container_width=True)
+    with _at_btn_col2:
+        _at_clear = st.button("清除调参结果", key="btn_clear_tune", use_container_width=True)
+
+    if _at_clear:
         st.session_state.clf_autotune_results = None
-        st.toast(f"已应用第{_chosen_idx+1}名参数 (AUC={_chosen['auc']:.4f})")
         st.rerun()
 
-    if st.button("清除调参结果", key="btn_clear_tune"):
-        st.session_state.clf_autotune_results = None
+    if _at_train:
+        st.session_state._clf_tune_train_active = True
+        st.session_state._clf_tune_chosen_idx = _at_options.index(_at_choice)
         st.rerun()
 
 
@@ -2931,9 +3067,32 @@ with tab9:
         # ── 近期预测明细表 ──
         st.subheader("近期预测明细")
         first_model = st.session_state.clf_selected_models[0]
+
+        # 构建日期→位置映射（归一化到 date 粒度避免精度问题），后续多处复用
+        _cur_df = st.session_state.stock_data
+        _cur_date_pos = {}
+        if _cur_df is not None and not _cur_df.empty:
+            _cur_date_pos = {d.date(): i for i, d in enumerate(_cur_df.index)}
+
         if first_model in results:
             base_dates_f = results[first_model].oos_dates
-            base_future_ret_f = results[first_model].oos_future_ret
+            base_future_ret_f = results[first_model].oos_future_ret.copy()
+
+            # 用当前 stock_data 补充训练时无法计算的 future_ret（NaN → 实际收益）
+            if _cur_date_pos and len(base_dates_f) > 0:
+                _fd = st.session_state.clf_forecast_days
+                for _i in range(len(base_future_ret_f)):
+                    if not np.isnan(base_future_ret_f[_i]):
+                        continue
+                    _dt = pd.Timestamp(base_dates_f[_i]).date()
+                    if _dt in _cur_date_pos:
+                        _pos = _cur_date_pos[_dt]
+                        _target_pos = _pos + _fd
+                        if _target_pos < len(_cur_df):
+                            _close_now = float(_cur_df.iloc[_pos]["close"])
+                            _close_future = float(_cur_df.iloc[_target_pos]["close"])
+                            if _close_now > 0:
+                                base_future_ret_f[_i] = (_close_future - _close_now) / _close_now
 
         # ── 今日实时预测（基于最新交易日特征） ──
         _has_latest = False
@@ -2963,6 +3122,7 @@ with tab9:
                     break
             _latest_dt_str = "?"
             _predict_dt_str = "?"
+            _latest_verified = False
             if _latest_dt is not None:
                 _ts = pd.Timestamp(_latest_dt)
                 _latest_dt_str = _ts.strftime("%Y-%m-%d")
@@ -2970,24 +3130,40 @@ with tab9:
                 while _next.weekday() >= 5:
                     _next += pd.Timedelta(days=1)
                 _predict_dt_str = _next.strftime("%Y-%m-%d")
-            st.success(f"**基于 {_latest_dt_str} 收盘数据，预测 {_predict_dt_str} 上涨概率: {_fused_latest*100:.1f}%** (→ {_latest_dir})，实际结果待验证")
+                # 检查预测日数据是否已有（用 date 粒度匹配）
+                _ts_date = _ts.date()
+                _next_date = _next.date()
+                if _cur_df is not None and _ts_date in _cur_date_pos and _next_date in _cur_date_pos:
+                    _close_base = float(_cur_df.iloc[_cur_date_pos[_ts_date]]["close"])
+                    _close_pred = float(_cur_df.iloc[_cur_date_pos[_next_date]]["close"])
+                    if _close_base > 0:
+                        _actual_ret = (_close_pred - _close_base) / _close_base
+                        _actual_dir = "涨" if _actual_ret > 0 else "跌"
+                        _correct = "✓ 正确" if (_latest_dir == "涨") == (_actual_ret > 0) else "✗ 错误"
+                        _latest_verified = True
+            if _latest_verified:
+                st.success(f"**基于 {_latest_dt_str} 收盘数据，预测 {_predict_dt_str} 上涨概率: {_fused_latest*100:.1f}%** (→ {_latest_dir})，实际: {_actual_dir} ({_actual_ret*100:+.2f}%) {_correct}")
+            else:
+                st.success(f"**基于 {_latest_dt_str} 收盘数据，预测 {_predict_dt_str} 上涨概率: {_fused_latest*100:.1f}%** (→ {_latest_dir})，实际结果待验证")
 
-        # 展示 OOS 最新预测（下一交易日上涨概率）
+        # 展示 OOS 最新预测（下一交易日上涨概率）— 仅在与"今日实时预测"不重复时显示
         if first_model in results and len(base_dates_f) > 0:
             latest_date = pd.Timestamp(base_dates_f[-1]).strftime("%Y-%m-%d") if len(base_dates_f) > 0 else "?"
-            if show_ensemble and len(ens["fused_proba"]) > 0:
-                latest_proba = ens["fused_proba"][-1]
-                latest_dir = "涨" if latest_proba >= st.session_state.clf_threshold else "跌"
-                latest_future = base_future_ret_f[-1]
-                if bool(np.isnan(latest_future)):
-                    st.info(f"**{latest_date} 下一交易日上涨概率: {latest_proba*100:.1f}%** (→ {latest_dir})，实际结果待验证")
-                else:
-                    actual = "✓ 正确" if (latest_proba >= st.session_state.clf_threshold) == (latest_future > 0) else "✗ 错误"
-                    st.info(f"**{latest_date} 下一交易日上涨概率: {latest_proba*100:.1f}%** (→ {latest_dir})，实际: {actual}")
-            elif first_model in results and len(results[first_model].oos_probabilities) > 0:
-                latest_proba = results[first_model].oos_probabilities[-1]
-                latest_dir = "涨" if latest_proba >= st.session_state.clf_threshold else "跌"
-                st.info(f"**{latest_date} 下一交易日上涨概率 ({first_model}): {latest_proba*100:.1f}%** (→ {latest_dir})")
+            _oos_dup = _has_latest and _latest_dt is not None and latest_date == pd.Timestamp(_latest_dt).strftime("%Y-%m-%d")
+            if not _oos_dup:
+                if show_ensemble and len(ens["fused_proba"]) > 0:
+                    latest_proba = ens["fused_proba"][-1]
+                    latest_dir = "涨" if latest_proba >= st.session_state.clf_threshold else "跌"
+                    latest_future = base_future_ret_f[-1]
+                    if bool(np.isnan(latest_future)):
+                        st.info(f"**{latest_date} 下一交易日上涨概率: {latest_proba*100:.1f}%** (→ {latest_dir})，实际结果待验证")
+                    else:
+                        actual = "✓ 正确" if (latest_proba >= st.session_state.clf_threshold) == (latest_future > 0) else "✗ 错误"
+                        st.info(f"**{latest_date} 下一交易日上涨概率: {latest_proba*100:.1f}%** (→ {latest_dir})，实际: {actual}")
+                elif first_model in results and len(results[first_model].oos_probabilities) > 0:
+                    latest_proba = results[first_model].oos_probabilities[-1]
+                    latest_dir = "涨" if latest_proba >= st.session_state.clf_threshold else "跌"
+                    st.info(f"**{latest_date} 下一交易日上涨概率 ({first_model}): {latest_proba*100:.1f}%** (→ {latest_dir})")
         n_recent = st.number_input("显示最近 N 天", min_value=10, max_value=60, value=30, step=5, key="clf_recent_n")
 
         if first_model in results:
@@ -3066,7 +3242,7 @@ with tab9:
         st.subheader("导出预测结果")
         if first_model in results:
             base_dates_e = results[first_model].oos_dates
-            base_future_ret_e = results[first_model].oos_future_ret
+            base_future_ret_e = base_future_ret_f  # 使用已补充实际收益的版本
             base_next_day_e = getattr(results[first_model], 'oos_next_day_ret', results[first_model].oos_returns)
             n_total = len(base_dates_e)
 

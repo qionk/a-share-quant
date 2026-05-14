@@ -1209,3 +1209,143 @@ def auto_tune_optuna(
         "trials": trials_log,
         "found": best_auc >= target_auc,
     }
+
+
+# ── 并行调参（多进程） ──
+
+def _run_single_trial(args):
+    """单次试验执行函数（子进程中调用）"""
+    df, sample, selected_models, stock_code = args
+    params = {
+        "XGBoost": {
+            "learning_rate": sample["xgb_learning_rate"],
+            "n_estimators": sample["xgb_n_estimators"],
+            "max_depth": sample["xgb_max_depth"],
+            "subsample": sample["xgb_subsample"],
+            "colsample_bytree": sample["xgb_colsample_bytree"],
+            "min_child_weight": sample["xgb_min_child_weight"],
+            "reg_alpha": sample["xgb_reg_alpha"],
+            "reg_lambda": sample["xgb_reg_lambda"],
+        },
+        "ElasticNet": {
+            "C": sample["en_C"],
+            "l1_ratio": sample["en_l1_ratio"],
+            "max_iter": 5000,
+            "tol": 1e-3,
+        },
+    }
+
+    t0 = time.time()
+    try:
+        results, ensemble_result = run_classifier_pipeline(
+            df=df,
+            selected_models=selected_models,
+            params=params,
+            look_back=sample["look_back"],
+            n_splits=sample["n_splits"],
+            forecast_days=sample["forecast_days"],
+            threshold=0.5,
+            stock_code=stock_code,
+        )
+    except Exception:
+        return None
+    elapsed = round(time.time() - t0, 1)
+
+    auc = np.nan
+    if ensemble_result and ensemble_result.get("metrics"):
+        auc = ensemble_result["metrics"].get("auc", np.nan)
+    elif results:
+        first_model = list(results.keys())[0]
+        auc = results[first_model].overall_metrics.get("auc", np.nan)
+
+    if np.isnan(auc):
+        return None
+
+    return {
+        "look_back": sample["look_back"],
+        "forecast_days": sample["forecast_days"],
+        "n_splits": sample["n_splits"],
+        "lr": sample["xgb_learning_rate"],
+        "depth": sample["xgb_max_depth"],
+        "n_est": sample["xgb_n_estimators"],
+        "auc": round(auc, 4),
+        "elapsed": elapsed,
+        "params": params,
+        "sample": sample,
+    }
+
+
+def auto_tune_parallel(
+    df: pd.DataFrame,
+    stock_code: str = None,
+    target_auc: float = 0.53,
+    max_trials: int = 30,
+    selected_models: List[str] = None,
+    n_jobs: int = 4,
+    batch_cb: Optional[Callable] = None,
+) -> dict:
+    """
+    多进程并行调参：每批并行 n_jobs 个试验，批次完成后回调更新。
+    M3 建议 n_jobs=4 (性能核数)。
+
+    batch_cb: callable(completed_count, max_trials, batch_results: list[dict])
+              每批完成后回调，用于 UI 更新。
+    返回: {"best_params": {...}, "best_auc": float, "trials": [...], "found": bool}
+    """
+    import random as _rand
+    import multiprocessing as mp
+
+    if selected_models is None:
+        selected_models = ["XGBoost", "ElasticNet"]
+
+    # 预生成所有不重复的参数组合
+    all_samples = []
+    tried = set()
+    attempts = 0
+    while len(all_samples) < max_trials and attempts < max_trials * 3:
+        sample = {k: _rand.choice(v) for k, v in _TUNE_SEARCH_SPACE.items()}
+        sample_key = tuple(sorted(sample.items()))
+        if sample_key not in tried:
+            tried.add(sample_key)
+            all_samples.append(sample)
+        attempts += 1
+
+    trials = []
+    best_auc = 0.0
+    best_params = None
+    completed = 0
+
+    # 分批并行执行
+    ctx = mp.get_context("spawn")
+    for batch_start in range(0, len(all_samples), n_jobs):
+        batch_samples = all_samples[batch_start:batch_start + n_jobs]
+        args_list = [(df, s, selected_models, stock_code) for s in batch_samples]
+
+        with ctx.Pool(processes=min(n_jobs, len(batch_samples))) as pool:
+            batch_results = pool.map(_run_single_trial, args_list)
+
+        batch_valid = []
+        for i, result in enumerate(batch_results):
+            completed += 1
+            if result is None:
+                continue
+            result["trial"] = completed
+            trials.append(result)
+            batch_valid.append(result)
+
+            if result["auc"] > best_auc:
+                best_auc = result["auc"]
+                best_params = result["sample"]
+
+        if batch_cb and batch_valid:
+            batch_cb(completed, len(all_samples), batch_valid)
+
+        if best_auc >= target_auc:
+            break
+
+    return {
+        "best_params": best_params,
+        "best_auc": round(best_auc, 4),
+        "trials": trials,
+        "found": best_auc >= target_auc,
+    }
