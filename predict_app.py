@@ -1600,6 +1600,10 @@ if btn_clf_autotune and st.session_state.stock_data is not None:
             st.session_state.clf_look_back = bp["look_back"]
             st.session_state.clf_forecast_days = bp["forecast_days"]
             st.session_state.clf_n_splits = bp["n_splits"]
+            # 同步 widget key，确保 rerun 后 UI 显示新值
+            st.session_state.clf_look_back_slider = bp["look_back"]
+            st.session_state.clf_forecast_days_slider = bp["forecast_days"]
+            st.session_state.clf_n_splits_slider = bp["n_splits"]
             st.session_state.clf_params["XGBoost"] = {
                 "learning_rate": bp["xgb_learning_rate"],
                 "n_estimators": bp["xgb_n_estimators"],
@@ -1618,11 +1622,9 @@ if btn_clf_autotune and st.session_state.stock_data is not None:
             }
 
             if tune_result["found"]:
-                _tune_progress.progress(1.0, text=f"找到 AUC={tune_result['best_auc']:.4f} 的参数!")
-                st.success(f"找到 AUC={tune_result['best_auc']:.2%} 的参数组合！已自动填入侧边栏。")
+                st.toast(f"找到 AUC={tune_result['best_auc']:.2%} 的参数！已自动填入。")
             else:
-                _tune_progress.progress(1.0, text=f"未达标，最佳 AUC={tune_result['best_auc']:.4f}")
-                st.warning(f"{int(clf_max_trials)}次试验后最佳 AUC={tune_result['best_auc']:.2%}，未达到目标。已填入最佳参数。")
+                st.toast(f"最佳 AUC={tune_result['best_auc']:.2%}，未达标但已填入。")
         else:
             st.error("所有试验均失败，请检查数据。")
 
@@ -1634,6 +1636,7 @@ if btn_clf_autotune and st.session_state.stock_data is not None:
         st.code(traceback.format_exc())
 
     st.session_state.clf_autotune_active = False
+    st.rerun()
 
 
 # ═══════ 涨跌预测贝叶斯调参执行 ═══════
@@ -1678,6 +1681,9 @@ if btn_clf_optuna and st.session_state.stock_data is not None:
             st.session_state.clf_look_back = bp["look_back"]
             st.session_state.clf_forecast_days = bp["forecast_days"]
             st.session_state.clf_n_splits = bp["n_splits"]
+            st.session_state.clf_look_back_slider = bp["look_back"]
+            st.session_state.clf_forecast_days_slider = bp["forecast_days"]
+            st.session_state.clf_n_splits_slider = bp["n_splits"]
             st.session_state.clf_params["XGBoost"] = {
                 "learning_rate": bp["xgb_learning_rate"],
                 "n_estimators": bp["xgb_n_estimators"],
@@ -1696,11 +1702,9 @@ if btn_clf_optuna and st.session_state.stock_data is not None:
             }
 
             if tune_result["found"]:
-                _opt_progress.progress(1.0, text=f"找到 AUC={tune_result['best_auc']:.4f} 的参数!")
-                st.success(f"贝叶斯优化找到 AUC={tune_result['best_auc']:.2%} 的参数组合！已自动填入。")
+                st.toast(f"贝叶斯找到 AUC={tune_result['best_auc']:.2%} 的参数！已自动填入。")
             else:
-                _opt_progress.progress(1.0, text=f"未达标，最佳 AUC={tune_result['best_auc']:.4f}")
-                st.warning(f"{int(clf_max_trials_optuna)}次试验后最佳 AUC={tune_result['best_auc']:.2%}，未达到目标。已填入最佳参数。")
+                st.toast(f"最佳 AUC={tune_result['best_auc']:.2%}，未达标但已填入。")
         else:
             st.error("所有试验均失败，请检查数据。")
 
@@ -1714,6 +1718,7 @@ if btn_clf_optuna and st.session_state.stock_data is not None:
         st.code(traceback.format_exc())
 
     st.session_state.clf_autotune_active = False
+    st.rerun()
 
 
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(
