@@ -3238,7 +3238,7 @@ with tab9:
                         yaxis=dict(ticksuffix="%"),
                         hovermode="x unified",
                     )
-                    st.plotly_chart(fig_hist, use_container_width=True)
+                    st.plotly_chart(fig_hist, use_container_width=True, key=f"clf_hist_chart_{_sid}")
 
                     st.markdown("**预测明细（最近 30 天）**")
                     hist_table = []
