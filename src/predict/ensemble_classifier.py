@@ -935,3 +935,277 @@ def run_classifier_pipeline(
         progress_cb(1.0, "涨跌预测完成!")
 
     return results, ensemble_result
+
+
+# ── 自动调参：随机搜索 + 早停 ──
+
+_TUNE_SEARCH_SPACE = {
+    "look_back": [5, 10, 15, 20, 30, 40],
+    "forecast_days": [1, 2, 3, 5],
+    "n_splits": [4, 5, 6, 7, 8],
+    "xgb_learning_rate": [0.01, 0.03, 0.05, 0.08, 0.1],
+    "xgb_n_estimators": [80, 100, 150, 200, 300],
+    "xgb_max_depth": [3, 4, 5, 6],
+    "xgb_subsample": [0.6, 0.7, 0.8, 0.9],
+    "xgb_colsample_bytree": [0.5, 0.6, 0.7, 0.8],
+    "xgb_min_child_weight": [1, 3, 5, 8, 12],
+    "xgb_reg_alpha": [0, 0.1, 0.3, 0.5, 1.0],
+    "xgb_reg_lambda": [1.0, 2.0, 3.0, 4.0],
+    "en_C": [0.05, 0.1, 0.3, 0.5, 1.0],
+    "en_l1_ratio": [0.05, 0.1, 0.15, 0.3, 0.5],
+}
+
+
+def auto_tune_classifier(
+    df: pd.DataFrame,
+    stock_code: str = None,
+    target_auc: float = 0.53,
+    max_trials: int = 30,
+    selected_models: List[str] = None,
+    trial_cb: Optional[Callable] = None,
+) -> dict:
+    """
+    随机搜索参数空间，找到 ensemble AUC >= target_auc 的参数组合。
+
+    trial_cb: callable(trial_idx, max_trials, trial_result_dict) 每轮回调
+    返回: {"best_params": {...}, "best_auc": float, "trials": [...], "found": bool}
+    """
+    import random as _rand
+
+    if selected_models is None:
+        selected_models = ["XGBoost", "ElasticNet"]
+
+    trials = []
+    best_auc = 0.0
+    best_params = None
+    tried = set()
+
+    for trial_idx in range(max_trials):
+        # 随机采样参数
+        sample = {k: _rand.choice(v) for k, v in _TUNE_SEARCH_SPACE.items()}
+        sample_key = tuple(sorted(sample.items()))
+        if sample_key in tried:
+            continue
+        tried.add(sample_key)
+
+        params = {
+            "XGBoost": {
+                "learning_rate": sample["xgb_learning_rate"],
+                "n_estimators": sample["xgb_n_estimators"],
+                "max_depth": sample["xgb_max_depth"],
+                "subsample": sample["xgb_subsample"],
+                "colsample_bytree": sample["xgb_colsample_bytree"],
+                "min_child_weight": sample["xgb_min_child_weight"],
+                "reg_alpha": sample["xgb_reg_alpha"],
+                "reg_lambda": sample["xgb_reg_lambda"],
+            },
+            "ElasticNet": {
+                "C": sample["en_C"],
+                "l1_ratio": sample["en_l1_ratio"],
+                "max_iter": 5000,
+                "tol": 1e-3,
+            },
+        }
+
+        t0 = time.time()
+        try:
+            results, ensemble_result = run_classifier_pipeline(
+                df=df,
+                selected_models=selected_models,
+                params=params,
+                look_back=sample["look_back"],
+                n_splits=sample["n_splits"],
+                forecast_days=sample["forecast_days"],
+                threshold=0.5,
+                stock_code=stock_code,
+            )
+        except Exception:
+            continue
+        elapsed = round(time.time() - t0, 1)
+
+        # 提取 AUC
+        auc = np.nan
+        if ensemble_result and ensemble_result.get("metrics"):
+            auc = ensemble_result["metrics"].get("auc", np.nan)
+        elif results:
+            first_model = list(results.keys())[0]
+            auc = results[first_model].overall_metrics.get("auc", np.nan)
+
+        if np.isnan(auc):
+            continue
+
+        trial_result = {
+            "trial": trial_idx + 1,
+            "look_back": sample["look_back"],
+            "forecast_days": sample["forecast_days"],
+            "n_splits": sample["n_splits"],
+            "lr": sample["xgb_learning_rate"],
+            "depth": sample["xgb_max_depth"],
+            "n_est": sample["xgb_n_estimators"],
+            "auc": round(auc, 4),
+            "elapsed": elapsed,
+            "params": params,
+            "sample": sample,
+        }
+        trials.append(trial_result)
+
+        if auc > best_auc:
+            best_auc = auc
+            best_params = sample
+
+        if trial_cb:
+            trial_cb(trial_idx + 1, max_trials, trial_result)
+
+        if auc >= target_auc:
+            break
+
+    return {
+        "best_params": best_params,
+        "best_auc": round(best_auc, 4),
+        "trials": trials,
+        "found": best_auc >= target_auc,
+    }
+
+
+# ── 贝叶斯优化调参 (Optuna TPE) ──
+
+def auto_tune_optuna(
+    df: pd.DataFrame,
+    stock_code: str = None,
+    target_auc: float = 0.53,
+    max_trials: int = 20,
+    selected_models: List[str] = None,
+    trial_cb: Optional[Callable] = None,
+) -> dict:
+    """
+    使用 Optuna TPE 贝叶斯优化搜索最佳参数，收敛更快。
+
+    trial_cb: callable(trial_idx, max_trials, trial_result_dict) 每轮回调
+    返回: {"best_params": {...}, "best_auc": float, "trials": [...], "found": bool}
+    """
+    import optuna
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+    if selected_models is None:
+        selected_models = ["XGBoost", "ElasticNet"]
+
+    trials_log = []
+    found_early = [False]
+
+    def _objective(trial):
+        if found_early[0]:
+            raise optuna.TrialPruned()
+
+        sample = {
+            "look_back": trial.suggest_categorical("look_back", [5, 10, 15, 20, 30, 40]),
+            "forecast_days": trial.suggest_categorical("forecast_days", [1, 2, 3, 5]),
+            "n_splits": trial.suggest_categorical("n_splits", [4, 5, 6, 7, 8]),
+            "xgb_learning_rate": trial.suggest_categorical("xgb_learning_rate", [0.01, 0.03, 0.05, 0.08, 0.1]),
+            "xgb_n_estimators": trial.suggest_categorical("xgb_n_estimators", [80, 100, 150, 200, 300]),
+            "xgb_max_depth": trial.suggest_categorical("xgb_max_depth", [3, 4, 5, 6]),
+            "xgb_subsample": trial.suggest_categorical("xgb_subsample", [0.6, 0.7, 0.8, 0.9]),
+            "xgb_colsample_bytree": trial.suggest_categorical("xgb_colsample_bytree", [0.5, 0.6, 0.7, 0.8]),
+            "xgb_min_child_weight": trial.suggest_categorical("xgb_min_child_weight", [1, 3, 5, 8, 12]),
+            "xgb_reg_alpha": trial.suggest_categorical("xgb_reg_alpha", [0.0, 0.1, 0.3, 0.5, 1.0]),
+            "xgb_reg_lambda": trial.suggest_categorical("xgb_reg_lambda", [1.0, 2.0, 3.0, 4.0]),
+            "en_C": trial.suggest_categorical("en_C", [0.05, 0.1, 0.3, 0.5, 1.0]),
+            "en_l1_ratio": trial.suggest_categorical("en_l1_ratio", [0.05, 0.1, 0.15, 0.3, 0.5]),
+        }
+
+        params = {
+            "XGBoost": {
+                "learning_rate": sample["xgb_learning_rate"],
+                "n_estimators": sample["xgb_n_estimators"],
+                "max_depth": sample["xgb_max_depth"],
+                "subsample": sample["xgb_subsample"],
+                "colsample_bytree": sample["xgb_colsample_bytree"],
+                "min_child_weight": sample["xgb_min_child_weight"],
+                "reg_alpha": sample["xgb_reg_alpha"],
+                "reg_lambda": sample["xgb_reg_lambda"],
+            },
+            "ElasticNet": {
+                "C": sample["en_C"],
+                "l1_ratio": sample["en_l1_ratio"],
+                "max_iter": 5000,
+                "tol": 1e-3,
+            },
+        }
+
+        t0 = time.time()
+        try:
+            results, ensemble_result = run_classifier_pipeline(
+                df=df,
+                selected_models=selected_models,
+                params=params,
+                look_back=sample["look_back"],
+                n_splits=sample["n_splits"],
+                forecast_days=sample["forecast_days"],
+                threshold=0.5,
+                stock_code=stock_code,
+            )
+        except Exception:
+            return 0.0
+        elapsed = round(time.time() - t0, 1)
+
+        auc = np.nan
+        if ensemble_result and ensemble_result.get("metrics"):
+            auc = ensemble_result["metrics"].get("auc", np.nan)
+        elif results:
+            first_model = list(results.keys())[0]
+            auc = results[first_model].overall_metrics.get("auc", np.nan)
+
+        if np.isnan(auc):
+            return 0.0
+
+        trial_result = {
+            "trial": trial.number + 1,
+            "look_back": sample["look_back"],
+            "forecast_days": sample["forecast_days"],
+            "n_splits": sample["n_splits"],
+            "lr": sample["xgb_learning_rate"],
+            "depth": sample["xgb_max_depth"],
+            "n_est": sample["xgb_n_estimators"],
+            "auc": round(auc, 4),
+            "elapsed": elapsed,
+            "params": params,
+            "sample": sample,
+        }
+        trials_log.append(trial_result)
+
+        if trial_cb:
+            trial_cb(trial.number + 1, max_trials, trial_result)
+
+        if auc >= target_auc:
+            found_early[0] = True
+
+        return auc
+
+    study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=42))
+    study.optimize(_objective, n_trials=max_trials, show_progress_bar=False)
+
+    best_auc = study.best_value if study.best_trial else 0.0
+    best_params = None
+    if study.best_trial:
+        bp = study.best_trial.params
+        best_params = {
+            "look_back": bp["look_back"],
+            "forecast_days": bp["forecast_days"],
+            "n_splits": bp["n_splits"],
+            "xgb_learning_rate": bp["xgb_learning_rate"],
+            "xgb_n_estimators": bp["xgb_n_estimators"],
+            "xgb_max_depth": bp["xgb_max_depth"],
+            "xgb_subsample": bp["xgb_subsample"],
+            "xgb_colsample_bytree": bp["xgb_colsample_bytree"],
+            "xgb_min_child_weight": bp["xgb_min_child_weight"],
+            "xgb_reg_alpha": bp["xgb_reg_alpha"],
+            "xgb_reg_lambda": bp["xgb_reg_lambda"],
+            "en_C": bp["en_C"],
+            "en_l1_ratio": bp["en_l1_ratio"],
+        }
+
+    return {
+        "best_params": best_params,
+        "best_auc": round(best_auc, 4),
+        "trials": trials_log,
+        "found": best_auc >= target_auc,
+    }

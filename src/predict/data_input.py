@@ -203,17 +203,27 @@ def _fetch_turnover_netease(stock_code: str, start_date: str, end_date: str) -> 
 def load_from_akshare(stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
     """
     获取个股日线数据
-    优先用 akshare，失败后切换到东方财富 datacenter 备用源
+    优先用腾讯财经 newfqkline（稳定、含换手率），失败后切换 AKShare 备用
     """
-    # 尝试 akshare（快速失败，尽快 fallback 到腾讯源）
-    df = None
     last_err = None
+
+    # 主源：腾讯财经 newfqkline（前复权，含换手率）
+    try:
+        df = _fetch_via_tencent(stock_code, start_date, end_date)
+        if df is not None and not df.empty:
+            if "pct_change" not in df.columns or df["pct_change"].isna().all():
+                df["pct_change"] = df["close"].pct_change() * 100
+            return df
+    except Exception as e:
+        last_err = e
+
+    # 备用源：AKShare（东方财富，可能被限流）
     for attempt in range(MAX_RETRIES):
         try:
             df = ak.stock_zh_a_hist(
                 symbol=stock_code, period="daily",
                 start_date=start_date, end_date=end_date,
-                adjust="hfq",
+                adjust="qfq",
             )
             if df is not None and not df.empty:
                 df = df.rename(columns={
@@ -228,40 +238,11 @@ def load_from_akshare(stock_code: str, start_date: str, end_date: str) -> pd.Dat
                     if col not in df.columns:
                         if col == "pct_change":
                             df["pct_change"] = df["close"].pct_change() * 100
-
-                # 检查 AKShare 数据是否覆盖到 end_date，否则用腾讯源补齐最新几天
-                end_ts = pd.Timestamp(end_date)
-                if df.index[-1] < end_ts:
-                    try:
-                        # 腾讯源只取 AKShare 缺失的日期段（前复权，价格可能不同，
-                        # 但仅用于最新几天的补齐，回测时 pct_change 仍有效）
-                        gap_start = (df.index[-1] + pd.Timedelta(days=1)).strftime("%Y%m%d")
-                        df_gap = _fetch_via_tencent(stock_code, gap_start, end_date)
-                        if df_gap is not None and not df_gap.empty:
-                            df = pd.concat([df, df_gap]).sort_index()
-                            df = df[~df.index.duplicated(keep="last")]
-                    except Exception:
-                        pass
-
                 return df
         except Exception as e:
             last_err = e
             if attempt < MAX_RETRIES - 1:
                 time.sleep(RETRY_DELAY * (attempt + 1))
-
-    # akshare 失败，切换腾讯财经备用源
-    try:
-        df = _fetch_via_tencent(stock_code, start_date, end_date)
-        if df is not None and not df.empty:
-            if "pct_change" not in df.columns or df["pct_change"].isna().all():
-                df["pct_change"] = df["close"].pct_change() * 100
-            # 尝试通过网易补充换手率
-            turnover_s = _fetch_turnover_netease(stock_code, start_date, end_date)
-            if turnover_s is not None and not turnover_s.empty:
-                df["turnover"] = turnover_s.reindex(df.index)
-            return df
-    except Exception:
-        pass
 
     msg = f"未获取到 {stock_code} 的数据（主备数据源均失败）"
     if last_err:

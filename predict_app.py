@@ -287,6 +287,10 @@ if "clf_ensemble_result" not in st.session_state:
     st.session_state.clf_ensemble_result = None
 if "clf_results_stock_code" not in st.session_state:
     st.session_state.clf_results_stock_code = None
+if "clf_autotune_active" not in st.session_state:
+    st.session_state.clf_autotune_active = False
+if "clf_autotune_results" not in st.session_state:
+    st.session_state.clf_autotune_results = None
 
 
 def _param_changed(model_name, key, value, default_val):
@@ -680,6 +684,8 @@ def clf_elasticnet_dialog():
 
 btn_train = False
 btn_clf_train = False
+btn_clf_autotune = False
+btn_clf_optuna = False
 
 with st.sidebar:
     st.header("配置参数")
@@ -1023,6 +1029,26 @@ with st.sidebar:
     else:
         btn_clf_train = st.button("开始涨跌训练", type="primary", use_container_width=True,
             disabled=st.session_state.stock_data is None or len(st.session_state.clf_selected_models) == 0)
+
+    # 自动调参
+    st.divider()
+    st.caption("自动调参")
+    clf_target_auc = st.number_input("目标AUC", min_value=0.50, max_value=0.70,
+        value=0.53, step=0.01, format="%.2f", key="clf_target_auc")
+    _at_c1, _at_c2 = st.columns(2)
+    with _at_c1:
+        clf_max_trials = st.number_input("随机次数", min_value=5, max_value=100,
+            value=30, step=5, key="clf_max_trials")
+    with _at_c2:
+        clf_max_trials_optuna = st.number_input("贝叶斯次数", min_value=5, max_value=100,
+            value=15, step=5, key="clf_max_trials_optuna")
+    _at_b1, _at_b2 = st.columns(2)
+    with _at_b1:
+        btn_clf_autotune = st.button("随机调参", key="btn_clf_autotune", use_container_width=True,
+            disabled=st.session_state.stock_data is None or st.session_state.clf_autotune_active)
+    with _at_b2:
+        btn_clf_optuna = st.button("智能调参(贝叶斯)", key="btn_clf_optuna", use_container_width=True,
+        disabled=st.session_state.stock_data is None or st.session_state.clf_autotune_active)
 
 
 # ═══════ 构建 ModelConfig ═══════
@@ -1530,6 +1556,164 @@ if btn_clf_train and st.session_state.stock_data is not None:
 
     st.session_state.clf_training_active = False
     st.rerun()
+
+
+# ═══════ 涨跌预测自动调参执行 ═══════
+
+if btn_clf_autotune and st.session_state.stock_data is not None:
+    st.session_state.clf_autotune_active = True
+    from src.predict.ensemble_classifier import auto_tune_classifier
+
+    st.subheader("自动调参进行中")
+    _tune_progress = st.progress(0, text="准备中...")
+    _tune_table_placeholder = st.empty()
+    _tune_trials_display = []
+
+    def _tune_trial_cb(trial_idx, max_t, result):
+        _tune_progress.progress(trial_idx / max_t, text=f"试验 {trial_idx}/{max_t} | 当前AUC={result['auc']:.4f}")
+        _tune_trials_display.append({
+            "#": result["trial"],
+            "look_back": result["look_back"],
+            "forecast": result["forecast_days"],
+            "n_splits": result["n_splits"],
+            "lr": result["lr"],
+            "depth": result["depth"],
+            "n_est": result["n_est"],
+            "AUC": f"{result['auc']:.4f}",
+            "耗时(s)": result["elapsed"],
+        })
+        _tune_table_placeholder.dataframe(
+            pd.DataFrame(_tune_trials_display), use_container_width=True, hide_index=True)
+
+    try:
+        tune_result = auto_tune_classifier(
+            df=st.session_state.stock_data,
+            stock_code=st.session_state.stock_code,
+            target_auc=clf_target_auc,
+            max_trials=int(clf_max_trials),
+            selected_models=st.session_state.clf_selected_models,
+            trial_cb=_tune_trial_cb,
+        )
+
+        if tune_result["best_params"] is not None:
+            bp = tune_result["best_params"]
+            st.session_state.clf_look_back = bp["look_back"]
+            st.session_state.clf_forecast_days = bp["forecast_days"]
+            st.session_state.clf_n_splits = bp["n_splits"]
+            st.session_state.clf_params["XGBoost"] = {
+                "learning_rate": bp["xgb_learning_rate"],
+                "n_estimators": bp["xgb_n_estimators"],
+                "max_depth": bp["xgb_max_depth"],
+                "subsample": bp["xgb_subsample"],
+                "colsample_bytree": bp["xgb_colsample_bytree"],
+                "min_child_weight": bp["xgb_min_child_weight"],
+                "reg_alpha": bp["xgb_reg_alpha"],
+                "reg_lambda": bp["xgb_reg_lambda"],
+            }
+            st.session_state.clf_params["ElasticNet"] = {
+                "C": bp["en_C"],
+                "l1_ratio": bp["en_l1_ratio"],
+                "max_iter": 5000,
+                "tol": 1e-3,
+            }
+
+            if tune_result["found"]:
+                _tune_progress.progress(1.0, text=f"找到 AUC={tune_result['best_auc']:.4f} 的参数!")
+                st.success(f"找到 AUC={tune_result['best_auc']:.2%} 的参数组合！已自动填入侧边栏。")
+            else:
+                _tune_progress.progress(1.0, text=f"未达标，最佳 AUC={tune_result['best_auc']:.4f}")
+                st.warning(f"{int(clf_max_trials)}次试验后最佳 AUC={tune_result['best_auc']:.2%}，未达到目标。已填入最佳参数。")
+        else:
+            st.error("所有试验均失败，请检查数据。")
+
+        st.session_state.clf_autotune_results = tune_result.get("trials")
+
+    except Exception as e:
+        st.error(f"自动调参失败: {e}")
+        import traceback
+        st.code(traceback.format_exc())
+
+    st.session_state.clf_autotune_active = False
+
+
+# ═══════ 涨跌预测贝叶斯调参执行 ═══════
+
+if btn_clf_optuna and st.session_state.stock_data is not None:
+    st.session_state.clf_autotune_active = True
+    from src.predict.ensemble_classifier import auto_tune_optuna
+
+    st.subheader("智能调参 (贝叶斯优化)")
+    _opt_progress = st.progress(0, text="准备中...")
+    _opt_table_placeholder = st.empty()
+    _opt_trials_display = []
+
+    def _optuna_trial_cb(trial_idx, max_t, result):
+        _opt_progress.progress(trial_idx / max_t, text=f"试验 {trial_idx}/{max_t} | 当前AUC={result['auc']:.4f}")
+        _opt_trials_display.append({
+            "#": result["trial"],
+            "look_back": result["look_back"],
+            "forecast": result["forecast_days"],
+            "n_splits": result["n_splits"],
+            "lr": result["lr"],
+            "depth": result["depth"],
+            "n_est": result["n_est"],
+            "AUC": f"{result['auc']:.4f}",
+            "耗时(s)": result["elapsed"],
+        })
+        _opt_table_placeholder.dataframe(
+            pd.DataFrame(_opt_trials_display), use_container_width=True, hide_index=True)
+
+    try:
+        tune_result = auto_tune_optuna(
+            df=st.session_state.stock_data,
+            stock_code=st.session_state.stock_code,
+            target_auc=clf_target_auc,
+            max_trials=int(clf_max_trials_optuna),
+            selected_models=st.session_state.clf_selected_models,
+            trial_cb=_optuna_trial_cb,
+        )
+
+        if tune_result["best_params"] is not None:
+            bp = tune_result["best_params"]
+            st.session_state.clf_look_back = bp["look_back"]
+            st.session_state.clf_forecast_days = bp["forecast_days"]
+            st.session_state.clf_n_splits = bp["n_splits"]
+            st.session_state.clf_params["XGBoost"] = {
+                "learning_rate": bp["xgb_learning_rate"],
+                "n_estimators": bp["xgb_n_estimators"],
+                "max_depth": bp["xgb_max_depth"],
+                "subsample": bp["xgb_subsample"],
+                "colsample_bytree": bp["xgb_colsample_bytree"],
+                "min_child_weight": bp["xgb_min_child_weight"],
+                "reg_alpha": bp["xgb_reg_alpha"],
+                "reg_lambda": bp["xgb_reg_lambda"],
+            }
+            st.session_state.clf_params["ElasticNet"] = {
+                "C": bp["en_C"],
+                "l1_ratio": bp["en_l1_ratio"],
+                "max_iter": 5000,
+                "tol": 1e-3,
+            }
+
+            if tune_result["found"]:
+                _opt_progress.progress(1.0, text=f"找到 AUC={tune_result['best_auc']:.4f} 的参数!")
+                st.success(f"贝叶斯优化找到 AUC={tune_result['best_auc']:.2%} 的参数组合！已自动填入。")
+            else:
+                _opt_progress.progress(1.0, text=f"未达标，最佳 AUC={tune_result['best_auc']:.4f}")
+                st.warning(f"{int(clf_max_trials_optuna)}次试验后最佳 AUC={tune_result['best_auc']:.2%}，未达到目标。已填入最佳参数。")
+        else:
+            st.error("所有试验均失败，请检查数据。")
+
+        st.session_state.clf_autotune_results = tune_result.get("trials")
+
+    except ImportError:
+        st.error("需要安装 optuna: `pip install optuna`")
+    except Exception as e:
+        st.error(f"贝叶斯调参失败: {e}")
+        import traceback
+        st.code(traceback.format_exc())
+
+    st.session_state.clf_autotune_active = False
 
 
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(
