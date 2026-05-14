@@ -265,7 +265,7 @@ if "clf_params" not in st.session_state:
             "subsample": 0.8, "colsample_bytree": 0.8,
             "min_child_weight": 1, "reg_alpha": 0.0, "reg_lambda": 1.0,
         },
-        "ElasticNet": {"C": 1.0, "l1_ratio": 0.5, "max_iter": 5000, "tol": 1e-3},
+        "ElasticNet": {"C": 1.0, "l1_ratio": 0.15, "max_iter": 5000, "tol": 1e-3},
     }
 if "clf_recommended_params" not in st.session_state:
     st.session_state.clf_recommended_params = None
@@ -285,6 +285,8 @@ if "clf_threshold" not in st.session_state:
     st.session_state.clf_threshold = 0.50
 if "clf_ensemble_result" not in st.session_state:
     st.session_state.clf_ensemble_result = None
+if "clf_results_stock_code" not in st.session_state:
+    st.session_state.clf_results_stock_code = None
 
 
 def _param_changed(model_name, key, value, default_val):
@@ -609,14 +611,14 @@ def clf_xgboost_dialog():
         "min_child_weight": 1, "reg_alpha": 0.0, "reg_lambda": 1.0,
     }
 
-    new_lr = st.slider("学习率 learning_rate", 0.001, 0.50, params.get("learning_rate", 0.1), 0.001, key="dg_clf_xgb_lr", format="%.3f")
-    new_n = st.slider("树数量 n_estimators", 10, 1000, params.get("n_estimators", 100), 10, key="dg_clf_xgb_n")
-    new_md = st.slider("最大深度 max_depth", 2, 15, params.get("max_depth", 6), 1, key="dg_clf_xgb_md")
-    new_ss = st.slider("子样本比例 subsample", 0.3, 1.0, params.get("subsample", 0.8), 0.05, key="dg_clf_xgb_ss")
-    new_cbt = st.slider("列采样比例 colsample_bytree", 0.3, 1.0, params.get("colsample_bytree", 0.8), 0.05, key="dg_clf_xgb_cbt")
-    new_mcw = st.slider("最小子节点权重 min_child_weight", 0, 20, params.get("min_child_weight", 1), 1, key="dg_clf_xgb_mcw")
-    new_ra = st.slider("L1正则 reg_alpha", 0.0, 10.0, params.get("reg_alpha", 0.0), 0.01, key="dg_clf_xgb_ra", format="%.2f")
-    new_rl = st.slider("L2正则 reg_lambda", 0.0, 10.0, params.get("reg_lambda", 1.0), 0.01, key="dg_clf_xgb_rl", format="%.2f")
+    new_lr = st.number_input("学习率 learning_rate", min_value=0.001, max_value=0.50, value=params.get("learning_rate", 0.1), step=0.001, key="dg_clf_xgb_lr", format="%.3f")
+    new_n = st.number_input("树数量 n_estimators", min_value=10, max_value=1000, value=params.get("n_estimators", 100), step=10, key="dg_clf_xgb_n")
+    new_md = st.number_input("最大深度 max_depth", min_value=2, max_value=15, value=params.get("max_depth", 6), step=1, key="dg_clf_xgb_md")
+    new_ss = st.number_input("子样本比例 subsample", min_value=0.3, max_value=1.0, value=params.get("subsample", 0.8), step=0.05, key="dg_clf_xgb_ss", format="%.2f")
+    new_cbt = st.number_input("列采样比例 colsample_bytree", min_value=0.3, max_value=1.0, value=params.get("colsample_bytree", 0.8), step=0.05, key="dg_clf_xgb_cbt", format="%.2f")
+    new_mcw = st.number_input("最小子节点权重 min_child_weight", min_value=0, max_value=20, value=params.get("min_child_weight", 1), step=1, key="dg_clf_xgb_mcw")
+    new_ra = st.number_input("L1正则 reg_alpha", min_value=0.0, max_value=10.0, value=params.get("reg_alpha", 0.0), step=0.01, key="dg_clf_xgb_ra", format="%.2f")
+    new_rl = st.number_input("L2正则 reg_lambda", min_value=0.0, max_value=10.0, value=params.get("reg_lambda", 1.0), step=0.01, key="dg_clf_xgb_rl", format="%.2f")
 
     c1, c2 = st.columns(2)
     if c1.button("恢复默认", use_container_width=True, key="clf_xgb_reset"):
@@ -644,16 +646,16 @@ def clf_xgboost_dialog():
 @st.dialog("ElasticNet 分类器参数设置")
 def clf_elasticnet_dialog():
     params = st.session_state.clf_params["ElasticNet"]
-    defaults = {"C": 1.0, "l1_ratio": 0.5, "max_iter": 5000, "tol": 1e-3}
+    defaults = {"C": 1.0, "l1_ratio": 0.15, "max_iter": 5000, "tol": 1e-3}
 
-    new_C = st.slider("正则化强度 C (越小越强)", 0.0, 2.0, params.get("C", 1.0), 0.01,
+    new_C = st.number_input("正则化强度 C (越小越强)", min_value=0.0, max_value=2.0, value=params.get("C", 1.0), step=0.01,
                       key="dg_clf_en_c", format="%.2f")
-    new_l1 = st.slider("L1比例 l1_ratio", 0.0, 1.0, params.get("l1_ratio", 0.5), 0.01,
+    new_l1 = st.number_input("L1比例 l1_ratio", min_value=0.0, max_value=1.0, value=params.get("l1_ratio", 0.15), step=0.01,
                        key="dg_clf_en_l1", format="%.2f")
-    new_mi = st.slider("最大迭代次数 max_iter", 500, 20000, params.get("max_iter", 5000), 500,
+    new_mi = st.number_input("最大迭代次数 max_iter", min_value=500, max_value=20000, value=params.get("max_iter", 5000), step=500,
                        key="dg_clf_en_mi")
-    new_tol = st.select_slider("收敛容差 tol", options=[1e-2, 1e-3, 1e-4, 1e-5, 1e-6],
-                               value=params.get("tol", 1e-3), key="dg_clf_en_tol")
+    new_tol = st.number_input("收敛容差 tol", min_value=1e-6, max_value=1e-2, value=params.get("tol", 1e-3), step=1e-4,
+                              key="dg_clf_en_tol", format="%.6f")
 
     c1, c2 = st.columns(2)
     if c1.button("恢复默认", use_container_width=True, key="clf_en_reset"):
@@ -955,24 +957,24 @@ with st.sidebar:
         default=st.session_state.clf_selected_models,
         help="XGBoost 二分类器 + ElasticNet LogisticRegression")
 
-    st.session_state.clf_look_back = st.slider(
-        "特征回溯天数", 1, 60, st.session_state.clf_look_back,
-        key="clf_look_back_slider",
+    st.session_state.clf_look_back = st.number_input(
+        "特征回溯天数", min_value=1, max_value=60, value=st.session_state.clf_look_back,
+        step=1, key="clf_look_back_slider",
         help="每个样本使用过去 N 天的特征")
 
-    st.session_state.clf_n_splits = st.slider(
-        "扩展窗口折数", 3, 10, st.session_state.clf_n_splits,
-        key="clf_n_splits_slider",
+    st.session_state.clf_n_splits = st.number_input(
+        "扩展窗口折数", min_value=3, max_value=10, value=st.session_state.clf_n_splits,
+        step=1, key="clf_n_splits_slider",
         help="时间序列扩展窗口验证的折数")
 
-    st.session_state.clf_forecast_days = st.slider(
-        "预测持有天数", 1, 20, st.session_state.clf_forecast_days,
-        key="clf_forecast_days_slider",
+    st.session_state.clf_forecast_days = st.number_input(
+        "预测持有天数", min_value=1, max_value=20, value=st.session_state.clf_forecast_days,
+        step=1, key="clf_forecast_days_slider",
         help="T日收盘买入，持有N天后T+N日收盘卖出。1=次日卖出")
 
-    st.session_state.clf_threshold = st.slider(
-        "概率阈值", 0.30, 0.70, st.session_state.clf_threshold,
-        0.01, key="clf_threshold_slider",
+    st.session_state.clf_threshold = st.number_input(
+        "概率阈值", min_value=0.30, max_value=0.70, value=st.session_state.clf_threshold,
+        step=0.01, format="%.2f", key="clf_threshold_slider",
         help="融合概率 >= 阈值时做多，否则空仓（默认0.5）")
 
     st.caption("分类器参数（🔵 = 已修改）")
@@ -1487,16 +1489,20 @@ if btn_clf_train and st.session_state.stock_data is not None:
             progress_cb=clf_progress_cb,
             forecast_days=st.session_state.clf_forecast_days,
             threshold=st.session_state.clf_threshold,
+            stock_code=st.session_state.stock_code,
         )
 
         st.session_state.clf_results = results
         st.session_state.clf_ensemble_result = ensemble_result
+        st.session_state.clf_results_stock_code = st.session_state.stock_code
 
         # 保存到历史库
         try:
             from src.predict.clf_history_store import save_clf_session
+            _clf_stock_code = st.session_state.stock_code
+            _clf_stock_name = st.session_state.get("stock_name", _clf_stock_code)
             session_id = save_clf_session(
-                stock_code, stock_name,
+                _clf_stock_code, _clf_stock_name,
                 {
                     "forecast_days": st.session_state.clf_forecast_days,
                     "threshold": st.session_state.clf_threshold,
@@ -1506,7 +1512,7 @@ if btn_clf_train and st.session_state.stock_data is not None:
                     "params": st.session_state.clf_params,
                     "results": results,
                     "ensemble_result": ensemble_result,
-                    "data_dates": (stock_data.index[0], stock_data.index[-1]),
+                    "data_dates": (st.session_state.stock_data.index[0], st.session_state.stock_data.index[-1]),
                 },
             )
             if session_id > 0:
@@ -2525,6 +2531,14 @@ with tab8:
 # ── Tab 9: 涨跌预测 ──────────────────────────────────────────
 
 with tab9:
+    # 切换股票后自动清除旧结果
+    if (st.session_state.clf_results is not None
+            and st.session_state.clf_results_stock_code
+            and st.session_state.clf_results_stock_code != st.session_state.stock_code):
+        st.session_state.clf_results = None
+        st.session_state.clf_ensemble_result = None
+        st.session_state.clf_results_stock_code = None
+
     if st.session_state.clf_results is not None:
         results = st.session_state.clf_results
         ens = st.session_state.clf_ensemble_result
@@ -2535,6 +2549,15 @@ with tab9:
                     or ens.get("forecast_days") != st.session_state.clf_forecast_days):
                 ens["threshold"] = st.session_state.clf_threshold
                 ens["forecast_days"] = st.session_state.clf_forecast_days
+                # 用保存的动态权重重算融合概率
+                weights = ens.get("weights", {})
+                models = st.session_state.clf_selected_models
+                if weights and models[0] in weights and models[1] in weights:
+                    proba_a = results[models[0]].oos_probabilities
+                    proba_b = results[models[1]].oos_probabilities
+                    n_common = min(len(proba_a), len(proba_b))
+                    ens["fused_proba"] = (weights[models[0]] * proba_a[:n_common]
+                                          + weights[models[1]] * proba_b[:n_common])
                 ens["fused_signal"] = (ens["fused_proba"] >= st.session_state.clf_threshold).astype(int)
                 ens["metrics"] = calculate_classification_metrics(
                     ens["oos_actuals"], ens["fused_proba"],
@@ -2546,11 +2569,29 @@ with tab9:
 
         st.subheader("涨跌预测结果")
 
+        # 显示本次训练使用的特征数
+        _first_model = list(results.keys())[0] if results else None
+        if _first_model and results[_first_model].feature_names:
+            _n_used = len(results[_first_model].feature_names)
+            _has_tr = any("turnover" in f for f in results[_first_model].feature_names)
+            _has_excess = any("excess_ret" in f for f in results[_first_model].feature_names)
+            _tag_parts = [f"特征维度: {_n_used}"]
+            if _has_tr:
+                _tag_parts.append("换手率 ✅")
+            if _has_excess:
+                _tag_parts.append("相对强弱 ✅")
+            st.caption(" | ".join(_tag_parts))
         # ── 融合集成指标卡 ──
         show_ensemble = ens is not None and len(st.session_state.clf_selected_models) == 2
         if show_ensemble:
             m = ens["metrics"]
-            st.markdown("### 融合集成 (XGBoost + ElasticNet 概率平均)")
+            weights = ens.get("weights", {})
+            models = st.session_state.clf_selected_models
+            if weights and models[0] in weights and models[1] in weights:
+                w_str = f"{models[0]} {weights[models[0]]*100:.0f}% + {models[1]} {weights[models[1]]*100:.0f}%"
+            else:
+                w_str = "XGBoost + ElasticNet 等权"
+            st.markdown(f"### 融合集成 ({w_str})")
             mc1, mc2, mc3, mc4, mc5, mc6, mc7, mc8 = st.columns(8)
             mc1.metric("AUC", f"{m.get('auc', 0):.3f}")
             ic_val = m.get('ic', np.nan)
@@ -2697,12 +2738,19 @@ with tab9:
                 _has_latest = True
                 break
         if _has_latest:
-            # 融合概率
+            # 融合概率（使用动态权重）
             _latest_probas = []
+            _latest_weights = []
+            _ens_weights = ens.get("weights", {}) if ens else {}
             for _mn in st.session_state.clf_selected_models:
                 if _mn in results and not np.isnan(getattr(results[_mn], 'latest_proba', np.nan)):
                     _latest_probas.append(results[_mn].latest_proba)
-            _fused_latest = float(np.mean(_latest_probas)) if len(_latest_probas) > 1 else _latest_probas[0]
+                    _latest_weights.append(_ens_weights.get(_mn, 1.0 / len(st.session_state.clf_selected_models)))
+            if len(_latest_probas) > 1:
+                _w_sum = sum(_latest_weights)
+                _fused_latest = float(sum(p * w for p, w in zip(_latest_probas, _latest_weights)) / _w_sum)
+            else:
+                _fused_latest = _latest_probas[0]
             _latest_dir = "涨" if _fused_latest >= st.session_state.clf_threshold else "跌"
             _latest_dt = None
             for _mn in st.session_state.clf_selected_models:
@@ -2736,7 +2784,7 @@ with tab9:
                 latest_proba = results[first_model].oos_probabilities[-1]
                 latest_dir = "涨" if latest_proba >= st.session_state.clf_threshold else "跌"
                 st.info(f"**{latest_date} 下一交易日上涨概率 ({first_model}): {latest_proba*100:.1f}%** (→ {latest_dir})")
-        n_recent = st.slider("显示最近 N 天", 10, 60, 30, key="clf_recent_n")
+        n_recent = st.number_input("显示最近 N 天", min_value=10, max_value=60, value=30, step=5, key="clf_recent_n")
 
         if first_model in results:
             base_next_day_f = getattr(results[first_model], 'oos_next_day_ret', results[first_model].oos_returns)
@@ -2868,11 +2916,38 @@ with tab9:
     else:
         st.info("请在侧边栏「涨跌预测设置」中点击「开始涨跌训练」按钮")
         if st.session_state.stock_data is not None:
-            n = len(st.session_state.stock_data)
-            n_features = len([c for c in CLF_FEATURE_COLS if c in st.session_state.stock_data.columns])
+            _sd = st.session_state.stock_data
+            n = len(_sd)
+            n_features = len([c for c in CLF_FEATURE_COLS if c in _sd.columns])
             rec = get_recommended_params(n, n_features)
-            st.markdown(f"**当前数据量**: {n} 天, **可用特征**: {n_features} 个")
+            st.markdown(f"**当前数据量**: {n} 天, **可用基础特征**: {n_features} 个 (× look_back 展开)")
             st.info(f"推荐训练模式: **{rec['mode']}** (回溯: {rec['look_back']}天, 折数: {rec['n_splits']})")
+
+            # 数据质量提示
+            _has_turnover = "turnover" in _sd.columns and _sd["turnover"].notna().mean() > 0.5
+            _has_vol = "volume" in _sd.columns and (_sd["volume"] > 0).mean() > 0.5
+            _quality_items = []
+            _quality_items.append(f"{'✅' if _has_turnover else '❌'} 换手率")
+            _quality_items.append(f"{'✅' if _has_vol else '❌'} 成交量")
+            _quality_items.append(f"{'✅' if 'pct_change' in _sd.columns else '❌'} 涨跌幅")
+            st.caption("数据字段: " + " | ".join(_quality_items)
+                       + (" (换手率缺失时自动跳过相关特征)" if not _has_turnover else ""))
+            if not _has_turnover and st.session_state.stock_code:
+                if st.button("重新获取数据（修复换手率）", key="clf_refetch_turnover"):
+                    with st.spinner("重新获取中..."):
+                        try:
+                            from src.predict.stock_data_store import delete_stock_data, fetch_and_store
+                            delete_stock_data(st.session_state.stock_code)
+                            df_new, _, _ = fetch_and_store(
+                                st.session_state.stock_code,
+                                start_date=_sd.index[0].strftime("%Y%m%d"),
+                                end_date=_sd.index[-1].strftime("%Y%m%d"),
+                                max_days=10000)
+                            st.session_state.stock_data = df_new
+                            st.success("数据已刷新")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"重新获取失败: {e}")
 
     # ── 预测历史 ──
     st.markdown("---")
@@ -2880,45 +2955,68 @@ with tab9:
 
     try:
         from src.predict.clf_history_store import list_clf_sessions, load_clf_session, delete_clf_session
-        hist_sessions = list_clf_sessions(stock_code)
-    except Exception:
+        hist_sessions = list_clf_sessions(st.session_state.stock_code)
+    except Exception as _hist_err:
         hist_sessions = []
+        st.caption(f"历史记录加载失败: {_hist_err}")
 
     if not hist_sessions:
         st.caption("暂无历史预测记录，训练涨跌分类器后会自动保存")
     else:
-        hist_options = {
-            f"#{s['session_id']} | {s.get('trained_at', '?')} | "
-            f"持有{s.get('forecast_days', '?')}天 | 阈值{s.get('threshold', '?')} | "
-            f"{s.get('selected_models', [])} | {s.get('total_samples', 0)}样本"
-            : s["session_id"]
-            for s in hist_sessions
-        }
-        selected_label = st.selectbox("选择历史记录", list(hist_options.keys()), key="clf_hist_select")
-        if selected_label:
-            hist_id = hist_options[selected_label]
-            hist = load_clf_session(hist_id)
+        for s in hist_sessions:
+            _sid = s["session_id"]
+            _auc_str = ""
+            _ens_m = s.get("ensemble_metrics")
+            if _ens_m and _ens_m.get("auc") is not None:
+                _auc_str = f" | AUC={_ens_m['auc']:.3f}"
 
-            if hist:
-                # 参数摘要
+            # 下一日预测标签
+            _pred_str = ""
+            if s.get("latest_proba") is not None:
+                _signal_emoji = "🔴" if s.get("latest_signal") == 1 else "🟢"
+                _pred_str = f" | {_signal_emoji} 预测{'涨' if s.get('latest_signal') == 1 else '跌'} ({s['latest_proba']:.1%})"
+
+            _title = (
+                f"#{_sid} | {s.get('trained_at', '?')} | "
+                f"持有{s.get('forecast_days', '?')}天 | 阈值{s.get('threshold', '?')}"
+                f"{_auc_str}{_pred_str}"
+            )
+            with st.expander(_title, expanded=False):
+                hist = load_clf_session(_sid)
+                if not hist:
+                    st.warning("加载失败")
+                    continue
+
+                # 下一日预测醒目展示
+                if hist.get("latest_proba") is not None:
+                    _ldate = hist.get("latest_date", "?")
+                    _lproba = hist["latest_proba"]
+                    _lsignal = hist.get("latest_signal", 0)
+                    if _lsignal == 1:
+                        st.success(f"📈 预测下一交易日: **偏涨** | 概率 {_lproba:.1%} | 基于 {_ldate} 数据")
+                    else:
+                        st.error(f"📉 预测下一交易日: **偏跌** | 概率 {_lproba:.1%} | 基于 {_ldate} 数据")
+
                 st.caption(
-                    f"持有天数: {hist.get('forecast_days')} | 阈值: {hist.get('threshold')} | "
-                    f"回溯: {hist.get('look_back')}天 | 折数: {hist.get('n_splits')} | "
                     f"模型: {hist.get('selected_models')} | "
+                    f"回溯: {hist.get('look_back')}天 | 折数: {hist.get('n_splits')} | "
                     f"数据: {hist.get('data_start_date')} ~ {hist.get('data_end_date')} | "
                     f"OOS: {hist.get('oos_start_date')} ~ {hist.get('oos_end_date')}"
                 )
 
-                # 参数详情
                 params_hist = hist.get("params", {})
                 if params_hist:
                     with st.expander("训练参数", expanded=False):
                         st.json(params_hist)
 
-                # 融合指标卡
                 ens_m = hist.get("ensemble_metrics")
                 if ens_m:
-                    st.markdown("#### 融合集成指标")
+                    # 权重信息
+                    _w = ens_m.get("weights")
+                    if _w:
+                        _w_parts = [f"{k} {v*100:.0f}%" for k, v in _w.items()]
+                        st.caption(f"融合权重: {' + '.join(_w_parts)}")
+
                     hc1, hc2, hc3, hc4, hc5, hc6, hc7, hc8 = st.columns(8)
                     hc1.metric("AUC", f"{ens_m.get('auc', 0):.3f}" if ens_m.get('auc') is not None else "N/A")
                     ic_v = ens_m.get('ic')
@@ -2930,16 +3028,13 @@ with tab9:
                     hc7.metric("胜率", f"{ens_m.get('win_rate', 0)*100:.1f}%")
                     hc8.metric("盈亏比", f"{ens_m.get('profit_loss_ratio', 0):.2f}")
 
-                # 累计净值曲线
                 details = hist.get("details", [])
                 if details:
                     hist_dates = [d["trade_date"] for d in details]
-                    hist_probas = [d.get("next_day_proba") for d in details]
                     hist_signals = [d.get("fused_signal") or 0 for d in details]
                     hist_future = [d.get("future_ret") or 0 for d in details]
                     hist_future_valid = [d.get("future_ret_valid", 1) for d in details]
 
-                    # 策略收益（只算有效行）
                     hist_strategy = []
                     for j in range(len(hist_dates)):
                         if hist_future_valid[j] and hist_signals[j] == 1:
@@ -2948,22 +3043,20 @@ with tab9:
                             hist_strategy.append(0.0)
                     hist_cum = np.cumprod(1 + np.array(hist_strategy)) - 1
 
-                    st.markdown("#### 累计净值曲线")
                     fig_hist = go.Figure()
                     fig_hist.add_trace(go.Scatter(
                         x=hist_dates, y=hist_cum * 100,
                         name="融合集成", mode="lines",
                         line=dict(color="#2ca02c", width=2)))
                     fig_hist.update_layout(
-                        height=350,
+                        height=300,
                         yaxis_title="累计收益率(%)",
                         yaxis=dict(ticksuffix="%"),
                         hovermode="x unified",
                     )
                     st.plotly_chart(fig_hist, use_container_width=True)
 
-                    # 明细表（最近 30 行）
-                    st.markdown("#### 预测明细（最近 30 天）")
+                    st.markdown("**预测明细（最近 30 天）**")
                     hist_table = []
                     for d in details[-30:]:
                         fr = d.get("future_ret")
@@ -2982,11 +3075,10 @@ with tab9:
                         })
                     st.dataframe(pd.DataFrame(hist_table), use_container_width=True, hide_index=True)
 
-                # 删除按钮
-                if st.button("删除此记录", key=f"clf_hist_del_{hist_id}", type="secondary"):
+                if st.button("删除此记录", key=f"clf_hist_del_{_sid}", type="secondary"):
                     try:
-                        delete_clf_session(hist_id)
-                        st.toast(f"已删除 Session #{hist_id}")
+                        delete_clf_session(_sid)
+                        st.toast(f"已删除 Session #{_sid}")
                         st.rerun()
                     except Exception as del_err:
                         st.error(f"删除失败: {del_err}")

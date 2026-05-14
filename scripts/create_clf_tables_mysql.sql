@@ -19,6 +19,9 @@ CREATE TABLE IF NOT EXISTS clf_training_sessions (
     total_samples INT,
     ensemble_metrics JSON,
     model_metrics JSON,
+    latest_date DATE,
+    latest_proba FLOAT,
+    latest_signal TINYINT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_clf_stock_code (stock_code),
     INDEX idx_clf_trained_at (trained_at)
@@ -34,6 +37,7 @@ CREATE TABLE IF NOT EXISTS clf_prediction_details (
     en_proba FLOAT,
     future_ret FLOAT,
     future_ret_valid TINYINT DEFAULT 1,
+    next_day_ret FLOAT,
     INDEX idx_clf_session (session_id),
     INDEX idx_clf_trade_date (trade_date),
     FOREIGN KEY (session_id) REFERENCES clf_training_sessions(id) ON DELETE CASCADE

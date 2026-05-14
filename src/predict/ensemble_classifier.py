@@ -36,11 +36,40 @@ warnings.filterwarnings("ignore")
 CLF_FEATURE_COLS = [
     # 价格变化
     "pct_change", "日收益率",
-    # 技术指标（最有信号量的几个）
-    "rsi", "dif", "macd",
-    # 量价配合（最关键的信息）
+    # 多周期动量
+    "ret_2d", "ret_3d", "ret_5d", "ret_10d",
+    # 均线偏离度
+    "close_ma5_bias", "close_ma10_bias", "close_ma20_bias", "ma5_ma10_cross",
+    # 波动率
+    "volatility_5d", "volatility_10d", "volatility_20d",
+    # 技术指标
+    "rsi", "rsi_6", "rsi_14", "dif", "macd",
+    # K线形态
+    "upper_shadow", "lower_shadow", "body_ratio", "high_low_range",
+    # 量价配合
     "成交量变化率", "相对成交量", "量价配合度",
     "放量上涨", "缩量下跌",
+    # 成交量多周期
+    "vol_chg_3d", "vol_chg_5d", "vol_ratio_5d",
+    # ── 科技股专用 ──
+    # 换手率系列
+    "turnover", "turnover_ma5", "turnover_ma10",
+    "turnover_bias", "turnover_accel",
+    "cum_turnover_5d", "cum_turnover_10d",
+    # 跳空缺口
+    "gap", "gap_abs", "gap_up", "gap_down",
+    # 价格位置
+    "price_pos_5d", "price_pos_10d", "price_pos_20d",
+    "drawdown_5d", "drawdown_10d", "drawdown_20d",
+    # 连涨连跌
+    "streak_up", "streak_down",
+    # ATR
+    "atr_5", "atr_14", "atr_ratio",
+    # 涨停板效应
+    "near_limit_up", "near_limit_down",
+    "limit_up_count_10d", "limit_down_count_10d",
+    # 相对强弱（需指数数据，可选）
+    "excess_ret", "excess_ret_5d", "excess_ret_10d", "excess_ret_20d",
 ]
 
 
@@ -172,7 +201,7 @@ def build_elasticnet(params: dict):
     """ElasticNet LogisticRegression"""
     return LogisticRegression(
         C=params.get("C", 1.0),
-        l1_ratio=params.get("l1_ratio", 0.5),
+        l1_ratio=params.get("l1_ratio", 0.15),
         penalty="elasticnet",
         solver="saga",
         max_iter=params.get("max_iter", 5000),
@@ -562,7 +591,9 @@ def run_expanding_window(
 # ── 智能参数推荐 ──
 
 def get_recommended_params(n_samples: int, n_features: int = 30) -> dict:
-    """根据有效样本量返回推荐参数。
+    """根据有效样本量返回推荐参数（针对科技股优化）。
+
+    科技股特点：波动大、换手高、趋势短 → 短回溯 + 浅树 + 强正则。
 
     7 档:
       tiny       < 200
@@ -577,98 +608,98 @@ def get_recommended_params(n_samples: int, n_features: int = 30) -> dict:
         return {
             "mode": "tiny",
             "xgb": {
-                "n_estimators": 50, "max_depth": 3, "learning_rate": 0.1,
-                "subsample": 0.8, "colsample_bytree": 0.8,
-                "min_child_weight": 3, "reg_alpha": 0.5, "reg_lambda": 1.0,
+                "n_estimators": 60, "max_depth": 2, "learning_rate": 0.08,
+                "subsample": 0.75, "colsample_bytree": 0.75,
+                "min_child_weight": 8, "reg_alpha": 0.5, "reg_lambda": 3.0,
             },
             "elasticnet": {
-                "C": 1.0, "l1_ratio": 0.5, "max_iter": 5000, "tol": 1e-3,
+                "C": 0.5, "l1_ratio": 0.15, "max_iter": 5000, "tol": 1e-3,
             },
-            "look_back": min(10, max(3, n_samples // 10)),
+            "look_back": 5,
             "n_splits": 3,
         }
     elif n_samples < 500:
         return {
             "mode": "small",
             "xgb": {
-                "n_estimators": 100, "max_depth": 4, "learning_rate": 0.05,
-                "subsample": 0.8, "colsample_bytree": 0.8,
-                "min_child_weight": 2, "reg_alpha": 0.3, "reg_lambda": 1.0,
+                "n_estimators": 80, "max_depth": 2, "learning_rate": 0.06,
+                "subsample": 0.75, "colsample_bytree": 0.75,
+                "min_child_weight": 8, "reg_alpha": 0.4, "reg_lambda": 3.0,
             },
             "elasticnet": {
-                "C": 1.0, "l1_ratio": 0.3, "max_iter": 5000, "tol": 1e-3,
+                "C": 0.3, "l1_ratio": 0.12, "max_iter": 5000, "tol": 1e-3,
             },
-            "look_back": min(15, max(5, n_samples // 15)),
+            "look_back": 6,
             "n_splits": 4,
         }
     elif n_samples < 800:
         return {
             "mode": "medium",
             "xgb": {
-                "n_estimators": 150, "max_depth": 5, "learning_rate": 0.03,
-                "subsample": 0.8, "colsample_bytree": 0.7,
-                "min_child_weight": 1, "reg_alpha": 0.1, "reg_lambda": 1.0,
+                "n_estimators": 100, "max_depth": 2, "learning_rate": 0.05,
+                "subsample": 0.75, "colsample_bytree": 0.75,
+                "min_child_weight": 8, "reg_alpha": 0.4, "reg_lambda": 3.0,
             },
             "elasticnet": {
-                "C": 0.5, "l1_ratio": 0.15, "max_iter": 5000, "tol": 1e-4,
+                "C": 0.2, "l1_ratio": 0.10, "max_iter": 5000, "tol": 1e-4,
             },
-            "look_back": min(20, max(10, n_samples // 20)),
+            "look_back": 8,
             "n_splits": 5,
         }
     elif n_samples < 1200:
         return {
             "mode": "med_large",
             "xgb": {
-                "n_estimators": 200, "max_depth": 6, "learning_rate": 0.02,
-                "subsample": 0.8, "colsample_bytree": 0.7,
-                "min_child_weight": 1, "reg_alpha": 0.05, "reg_lambda": 0.5,
+                "n_estimators": 120, "max_depth": 2, "learning_rate": 0.05,
+                "subsample": 0.75, "colsample_bytree": 0.75,
+                "min_child_weight": 8, "reg_alpha": 0.4, "reg_lambda": 3.0,
             },
             "elasticnet": {
-                "C": 0.2, "l1_ratio": 0.1, "max_iter": 5000, "tol": 1e-4,
+                "C": 0.15, "l1_ratio": 0.10, "max_iter": 5000, "tol": 1e-4,
             },
-            "look_back": min(25, max(12, n_samples // 25)),
-            "n_splits": 5,
+            "look_back": 8,
+            "n_splits": 6,
         }
     elif n_samples < 2000:
         return {
             "mode": "large",
             "xgb": {
-                "n_estimators": 40, "max_depth": 2, "learning_rate": 0.25,
-                "subsample": 0.6, "colsample_bytree": 0.7,
-                "min_child_weight": 12, "reg_alpha": 0.3, "reg_lambda": 2.0,
+                "n_estimators": 150, "max_depth": 3, "learning_rate": 0.04,
+                "subsample": 0.75, "colsample_bytree": 0.70,
+                "min_child_weight": 10, "reg_alpha": 0.4, "reg_lambda": 3.0,
             },
             "elasticnet": {
-                "C": 0.1, "l1_ratio": 0.05, "max_iter": 5000, "tol": 1e-4,
+                "C": 0.10, "l1_ratio": 0.08, "max_iter": 8000, "tol": 1e-4,
             },
-            "look_back": 4,
-            "n_splits": 6,
+            "look_back": 8,
+            "n_splits": 7,
         }
     elif n_samples < 3000:
         return {
             "mode": "xlarge",
             "xgb": {
-                "n_estimators": 400, "max_depth": 7, "learning_rate": 0.01,
-                "subsample": 0.7, "colsample_bytree": 0.6,
-                "min_child_weight": 1, "reg_alpha": 0.01, "reg_lambda": 0.3,
+                "n_estimators": 180, "max_depth": 3, "learning_rate": 0.03,
+                "subsample": 0.70, "colsample_bytree": 0.65,
+                "min_child_weight": 12, "reg_alpha": 0.5, "reg_lambda": 3.5,
             },
             "elasticnet": {
-                "C": 0.05, "l1_ratio": 0.03, "max_iter": 8000, "tol": 1e-4,
+                "C": 0.08, "l1_ratio": 0.06, "max_iter": 8000, "tol": 1e-4,
             },
-            "look_back": min(30, max(20, n_samples // 30)),
-            "n_splits": 7,
+            "look_back": 10,
+            "n_splits": 8,
         }
     else:
         return {
             "mode": "xxlarge",
             "xgb": {
-                "n_estimators": 500, "max_depth": 8, "learning_rate": 0.005,
-                "subsample": 0.7, "colsample_bytree": 0.5,
-                "min_child_weight": 1, "reg_alpha": 0.0, "reg_lambda": 0.1,
+                "n_estimators": 200, "max_depth": 3, "learning_rate": 0.02,
+                "subsample": 0.70, "colsample_bytree": 0.60,
+                "min_child_weight": 12, "reg_alpha": 0.5, "reg_lambda": 4.0,
             },
             "elasticnet": {
-                "C": 0.02, "l1_ratio": 0.02, "max_iter": 10000, "tol": 1e-4,
+                "C": 0.05, "l1_ratio": 0.05, "max_iter": 10000, "tol": 1e-4,
             },
-            "look_back": min(40, max(20, n_samples // 35)),
+            "look_back": 10,
             "n_splits": 8,
         }
 
@@ -698,6 +729,70 @@ def check_params_deviation(current: Dict[str, dict], recommended: dict) -> List[
     return warnings_list
 
 
+# ── 动态融合权重 ──
+
+def _compute_ensemble_weights(result_a: 'ClfResult', result_b: 'ClfResult') -> dict:
+    """基于 AUC(40%) + Sharpe(30%) + 胜率(30%) 综合评分计算动态权重"""
+
+    def _score(r):
+        m = r.overall_metrics
+        auc = m.get("auc", 0.5)
+        sharpe = m.get("sharpe", 0.0)
+        win_rate = m.get("win_rate", 0.5)
+        if np.isnan(auc) or auc < 0.5:
+            auc = 0.5
+        if np.isnan(sharpe) or sharpe < 0:
+            sharpe = 0.0
+        if np.isnan(win_rate) or win_rate < 0:
+            win_rate = 0.0
+        return 0.4 * auc + 0.3 * sharpe + 0.3 * win_rate
+
+    score_a = _score(result_a)
+    score_b = _score(result_b)
+    total = score_a + score_b
+
+    if total <= 0:
+        w_a, w_b = 0.5, 0.5
+    else:
+        w_a = score_a / total
+        w_b = score_b / total
+
+    return {result_a.model_name: w_a, result_b.model_name: w_b}
+
+
+def _load_index_returns(stock_code: str, start_date, end_date) -> Optional[pd.Series]:
+    """
+    根据股票代码自动选择对应板块指数，返回日收益率 Series。
+    科技股(创业板300xxx/科创板688xxx) → 创业板指(399006)
+    主板 → 沪深300(000300)
+    加载失败返回 None（不影响训练）
+    """
+    if not stock_code:
+        return None
+    try:
+        import akshare as ak
+        if stock_code.startswith("3"):
+            index_code = "399006"
+        elif stock_code.startswith("688"):
+            index_code = "399006"
+        else:
+            index_code = "000300"
+
+        sd = pd.Timestamp(start_date).strftime("%Y%m%d")
+        ed = pd.Timestamp(end_date).strftime("%Y%m%d")
+        idx_df = ak.index_zh_a_hist(symbol=index_code, period="daily",
+                                     start_date=sd, end_date=ed)
+        if idx_df is None or idx_df.empty:
+            return None
+        idx_df["日期"] = pd.to_datetime(idx_df["日期"])
+        idx_df = idx_df.set_index("日期").sort_index()
+        idx_ret = idx_df["涨跌幅"] / 100.0
+        idx_ret.index.name = None
+        return idx_ret
+    except Exception:
+        return None
+
+
 # ── 完整管线 ──
 
 def run_classifier_pipeline(
@@ -709,6 +804,7 @@ def run_classifier_pipeline(
     progress_cb: Optional[Callable] = None,
     forecast_days: int = 1,
     threshold: float = 0.5,
+    stock_code: str = None,
 ):
     """
     分类器完整管线。
@@ -733,9 +829,12 @@ def run_classifier_pipeline(
     if progress_cb:
         progress_cb(0.0, "数据预处理中...")
 
+    # 0. 尝试加载板块指数日收益率（用于相对强弱特征）
+    index_returns = _load_index_returns(stock_code, df.index.min(), df.index.max())
+
     # 1. 预处理（添加 日收益率 / future_ret / 目标涨跌 / 成交量变化率 / 相对成交量 /
     #    量价配合度 / 放量上涨 / 缩量下跌）
-    df_proc = preprocess_data(df, forecast_days=forecast_days)
+    df_proc = preprocess_data(df, forecast_days=forecast_days, index_returns=index_returns)
 
     # 2. 技术指标（添加 MA / MACD / RSI / 布林带 / OBV / vol_ma / vwap 等，
     #    全部仅用历史数据，无前视）
@@ -789,7 +888,11 @@ def run_classifier_pipeline(
             proba_b = results[model_b].oos_probabilities
             n_common = min(len(proba_a), len(proba_b))
 
-            fused_proba = (proba_a[:n_common] + proba_b[:n_common]) / 2.0
+            # 动态权重：基于 AUC(40%) + Sharpe(30%) + 胜率(30%) 综合评分
+            weights = _compute_ensemble_weights(results[model_a], results[model_b])
+            w_a, w_b = weights[model_a], weights[model_b]
+
+            fused_proba = w_a * proba_a[:n_common] + w_b * proba_b[:n_common]
             fused_signal = (fused_proba >= threshold).astype(int)
 
             y_common = results[model_a].oos_actuals[:n_common]
@@ -810,6 +913,7 @@ def run_classifier_pipeline(
                 "fused_proba": fused_proba,
                 "fused_signal": fused_signal,
                 "metrics": ensemble_metrics,
+                "weights": {model_a: float(w_a), model_b: float(w_b)},
                 "oos_dates": dates_common,
                 "oos_returns": ret_common,
                 "oos_future_ret": fut_common,
@@ -818,6 +922,14 @@ def run_classifier_pipeline(
                 "threshold": threshold,
                 "forecast_days": forecast_days,
             }
+
+            # 融合最新日预测
+            lat_a = results[model_a].latest_proba
+            lat_b = results[model_b].latest_proba
+            if not np.isnan(lat_a) and not np.isnan(lat_b):
+                ensemble_result["latest_proba"] = float(w_a * lat_a + w_b * lat_b)
+                ensemble_result["latest_date"] = results[model_a].latest_date
+                ensemble_result["latest_signal"] = int(ensemble_result["latest_proba"] >= threshold)
 
     if progress_cb:
         progress_cb(1.0, "涨跌预测完成!")

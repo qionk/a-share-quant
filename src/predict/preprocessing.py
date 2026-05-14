@@ -10,7 +10,8 @@ import pandas as pd
 
 
 def preprocess_data(df: pd.DataFrame, return_clip: float = 0.10,
-                     forecast_days: int = 1) -> pd.DataFrame:
+                     forecast_days: int = 1,
+                     index_returns: pd.Series = None) -> pd.DataFrame:
     """
     统一数据预处理：计算日收益率目标 + 成交量衍生特征
 
@@ -20,6 +21,7 @@ def preprocess_data(df: pd.DataFrame, return_clip: float = 0.10,
 
     df 必须已有列: close, volume, pct_change（或从close计算）
     forecast_days: 持有天数，N日持有期收益 = close.pct_change(N).shift(-N)
+    index_returns: 可选，板块/大盘日收益率Series（index对齐），用于计算相对强弱
     """
     df = df.copy()
 
@@ -64,7 +66,116 @@ def preprocess_data(df: pd.DataFrame, return_clip: float = 0.10,
     # 缩量下跌: 跌 + 相对成交量 < 0.7
     df['缩量下跌'] = ((df['日收益率'] < 0) & (df['相对成交量'] < 0.7)).astype(int)
 
-    # ── 5. 处理缺失值 ─────────────────────────────
+    # ── 5. 多周期动量特征 ────────────────────────────
+    df['ret_2d'] = df['close'].pct_change(2)
+    df['ret_3d'] = df['close'].pct_change(3)
+    df['ret_5d'] = df['close'].pct_change(5)
+    df['ret_10d'] = df['close'].pct_change(10)
+
+    # ── 6. 均线偏离度 ─────────────────────────────
+    ma5 = df['close'].rolling(5).mean()
+    ma10 = df['close'].rolling(10).mean()
+    ma20 = df['close'].rolling(20).mean()
+    df['close_ma5_bias'] = (df['close'] - ma5) / ma5
+    df['close_ma10_bias'] = (df['close'] - ma10) / ma10
+    df['close_ma20_bias'] = (df['close'] - ma20) / ma20
+    df['ma5_ma10_cross'] = (ma5 - ma10) / ma10
+
+    # ── 7. 波动率特征 ─────────────────────────────
+    df['volatility_5d'] = df['日收益率'].rolling(5).std()
+    df['volatility_10d'] = df['日收益率'].rolling(10).std()
+    df['volatility_20d'] = df['日收益率'].rolling(20).std()
+
+    # ── 8. K线形态特征 ─────────────────────────────
+    df['upper_shadow'] = (df['high'] - df[['open', 'close']].max(axis=1)) / df['close']
+    df['lower_shadow'] = (df[['open', 'close']].min(axis=1) - df['low']) / df['close']
+    df['body_ratio'] = (df['close'] - df['open']) / (df['high'] - df['low']).replace(0, np.nan)
+    df['high_low_range'] = (df['high'] - df['low']) / df['close']
+
+    # ── 9. 多周期 RSI ─────────────────────────────
+    for period in [6, 14]:
+        delta = df['close'].diff()
+        gain = delta.where(delta > 0, 0.0).rolling(period).mean()
+        loss = (-delta.where(delta < 0, 0.0)).rolling(period).mean()
+        rs = gain / loss.replace(0, np.nan)
+        df[f'rsi_{period}'] = 100 - 100 / (1 + rs)
+
+    # ── 10. 成交量多周期特征 ──────────────────────────
+    df['vol_chg_3d'] = df['volume'].pct_change(3)
+    df['vol_chg_5d'] = df['volume'].pct_change(5)
+    vol_ma5 = df['volume'].rolling(5).mean()
+    df['vol_ratio_5d'] = df['volume'] / vol_ma5.replace(0, np.nan)
+
+    # ── 11. 科技股专用特征 ─────────────────────────────
+
+    # 换手率系列（科技股情绪核心指标）
+    # 仅在 turnover 有效数据超过 50% 时计算，避免 DB 缓存的腾讯源数据全为 NaN
+    has_turnover = ('turnover' in df.columns and
+                    df['turnover'].notna().mean() > 0.5)
+    if has_turnover:
+        df['turnover'] = pd.to_numeric(df['turnover'], errors='coerce')
+        df['turnover_ma5'] = df['turnover'].rolling(5).mean()
+        df['turnover_ma10'] = df['turnover'].rolling(10).mean()
+        df['turnover_bias'] = (df['turnover'] - df['turnover_ma5']) / df['turnover_ma5'].replace(0, np.nan)
+        df['turnover_accel'] = df['turnover'].diff().rolling(3).mean()
+        df['cum_turnover_5d'] = df['turnover'].rolling(5).sum()
+        df['cum_turnover_10d'] = df['turnover'].rolling(10).sum()
+    elif 'turnover' in df.columns:
+        df = df.drop(columns=['turnover'])
+
+    # 跳空缺口
+    prev_close = df['close'].shift(1)
+    df['gap'] = (df['open'] - prev_close) / prev_close
+    df['gap_abs'] = df['gap'].abs()
+    df['gap_up'] = (df['gap'] > 0.01).astype(int)
+    df['gap_down'] = (df['gap'] < -0.01).astype(int)
+
+    # 价格位置特征
+    for n in [5, 10, 20]:
+        rolling_high = df['high'].rolling(n).max()
+        rolling_low = df['low'].rolling(n).min()
+        price_range = (rolling_high - rolling_low).replace(0, np.nan)
+        df[f'price_pos_{n}d'] = (df['close'] - rolling_low) / price_range
+        df[f'drawdown_{n}d'] = (df['close'] - rolling_high) / rolling_high
+
+    # 连涨连跌天数
+    up = (df['日收益率'] > 0).astype(int)
+    down = (df['日收益率'] < 0).astype(int)
+    streak_up = up.copy()
+    streak_down = down.copy()
+    for i in range(1, len(df)):
+        if up.iloc[i] == 1:
+            streak_up.iloc[i] = streak_up.iloc[i - 1] + 1
+        if down.iloc[i] == 1:
+            streak_down.iloc[i] = streak_down.iloc[i - 1] + 1
+    df['streak_up'] = streak_up
+    df['streak_down'] = streak_down
+
+    # ATR（平均真实波幅）
+    tr = pd.concat([
+        df['high'] - df['low'],
+        (df['high'] - df['close'].shift(1)).abs(),
+        (df['low'] - df['close'].shift(1)).abs(),
+    ], axis=1).max(axis=1)
+    df['atr_5'] = tr.rolling(5).mean()
+    df['atr_14'] = tr.rolling(14).mean()
+    df['atr_ratio'] = df['atr_5'] / df['atr_14'].replace(0, np.nan)
+
+    # 涨停/跌停统计（科技股涨停板效应）
+    df['near_limit_up'] = (df['日收益率'] >= 0.09).astype(int)
+    df['near_limit_down'] = (df['日收益率'] <= -0.09).astype(int)
+    df['limit_up_count_10d'] = df['near_limit_up'].rolling(10).sum()
+    df['limit_down_count_10d'] = df['near_limit_down'].rolling(10).sum()
+
+    # ── 12. 相对强弱（vs 大盘/板块指数） ─────────────────
+    if index_returns is not None:
+        idx_ret = index_returns.reindex(df.index)
+        df['excess_ret'] = df['日收益率'] - idx_ret.fillna(0)
+        df['excess_ret_5d'] = df['excess_ret'].rolling(5).sum()
+        df['excess_ret_10d'] = df['excess_ret'].rolling(10).sum()
+        df['excess_ret_20d'] = df['excess_ret'].rolling(20).sum()
+
+    # ── 13. 处理缺失值 ─────────────────────────────
     # 保留 目标涨跌/future_ret/next_day_ret 为 NaN 的行（最后一天无下日数据），
     # 仅删除特征列（日收益率）为 NaN 的行（首行）
     df = df.dropna(subset=['日收益率'])

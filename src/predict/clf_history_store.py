@@ -13,6 +13,7 @@ import pandas as pd
 from datetime import datetime, date
 
 BATCH_SIZE = 500
+_TABLES_ENSURED = False
 
 
 def _get_conn():
@@ -40,6 +41,71 @@ def _get_conn():
         connect_timeout=10, read_timeout=30, write_timeout=30,
         autocommit=True,
     )
+
+
+def _ensure_tables(conn):
+    """首次调用时自动创建表（如不存在）"""
+    global _TABLES_ENSURED
+    if _TABLES_ENSURED:
+        return
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS clf_training_sessions (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            stock_code VARCHAR(20) NOT NULL,
+            stock_name VARCHAR(100),
+            trained_at DATETIME NOT NULL,
+            forecast_days INT DEFAULT 1,
+            threshold FLOAT DEFAULT 0.5,
+            look_back INT DEFAULT 20,
+            n_splits INT DEFAULT 5,
+            selected_models JSON,
+            params_json JSON,
+            data_start_date DATE,
+            data_end_date DATE,
+            oos_start_date DATE,
+            oos_end_date DATE,
+            total_samples INT,
+            ensemble_metrics JSON,
+            model_metrics JSON,
+            latest_date DATE,
+            latest_proba FLOAT,
+            latest_signal TINYINT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_clf_stock_code (stock_code),
+            INDEX idx_clf_trained_at (trained_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS clf_prediction_details (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            session_id INT NOT NULL,
+            trade_date DATE NOT NULL,
+            next_day_proba FLOAT,
+            fused_signal TINYINT,
+            xgb_proba FLOAT,
+            en_proba FLOAT,
+            future_ret FLOAT,
+            future_ret_valid TINYINT DEFAULT 1,
+            next_day_ret FLOAT,
+            INDEX idx_clf_session (session_id),
+            INDEX idx_clf_trade_date (trade_date),
+            FOREIGN KEY (session_id) REFERENCES clf_training_sessions(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    """)
+    # 兼容旧表：补加缺失字段
+    for alter_sql in [
+        "ALTER TABLE clf_prediction_details ADD COLUMN next_day_ret FLOAT",
+        "ALTER TABLE clf_training_sessions ADD COLUMN latest_date DATE",
+        "ALTER TABLE clf_training_sessions ADD COLUMN latest_proba FLOAT",
+        "ALTER TABLE clf_training_sessions ADD COLUMN latest_signal TINYINT",
+    ]:
+        try:
+            cur.execute(alter_sql)
+        except Exception:
+            pass
+    cur.close()
+    _TABLES_ENSURED = True
 
 
 def _safe_float(v):
@@ -77,6 +143,7 @@ def save_clf_session(stock_code: str, stock_name: str, session_data: dict) -> in
     if not conn:
         return -1
 
+    _ensure_tables(conn)
     cur = conn.cursor()
 
     trained_at = datetime.now()
@@ -112,6 +179,8 @@ def save_clf_session(stock_code: str, stock_name: str, session_data: dict) -> in
     ensemble_metrics = None
     if ensemble_result:
         ensemble_metrics = _serialize_metrics(ensemble_result.get("metrics", {}))
+        if ensemble_result.get("weights"):
+            ensemble_metrics["weights"] = {k: float(v) for k, v in ensemble_result["weights"].items()}
 
     model_metrics = {}
     for model_name, r in results.items():
@@ -120,14 +189,30 @@ def save_clf_session(stock_code: str, stock_name: str, session_data: dict) -> in
     model_metrics_json = json.dumps(model_metrics, ensure_ascii=False, default=str) if model_metrics else None
     ensemble_metrics_json = json.dumps(ensemble_metrics, ensure_ascii=False, default=str) if ensemble_metrics else None
 
+    # 提取最新日预测（下一交易日涨跌）
+    latest_pred_date = None
+    latest_pred_proba = None
+    latest_pred_signal = None
+    if ensemble_result:
+        latest_pred_proba = _safe_float(ensemble_result.get("latest_proba"))
+        latest_pred_signal = ensemble_result.get("latest_signal")
+        latest_pred_date = _to_date(ensemble_result.get("latest_date"))
+    if latest_pred_proba is None and results:
+        first_model = list(results.keys())[0]
+        if hasattr(results[first_model], 'latest_proba') and not np.isnan(results[first_model].latest_proba):
+            latest_pred_proba = float(results[first_model].latest_proba)
+            latest_pred_date = _to_date(results[first_model].latest_date)
+            latest_pred_signal = int(latest_pred_proba >= threshold)
+
     # 写入 session
     sql_session = """
         INSERT INTO clf_training_sessions
         (stock_code, stock_name, trained_at, forecast_days, threshold,
          look_back, n_splits, selected_models, params_json,
          data_start_date, data_end_date, oos_start_date, oos_end_date,
-         total_samples, ensemble_metrics, model_metrics)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+         total_samples, ensemble_metrics, model_metrics,
+         latest_date, latest_proba, latest_signal)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     """
     cur.execute(sql_session, (
         stock_code, stock_name, trained_at,
@@ -138,6 +223,7 @@ def save_clf_session(stock_code: str, stock_name: str, session_data: dict) -> in
         total_samples,
         ensemble_metrics_json,
         model_metrics_json,
+        latest_pred_date, latest_pred_proba, latest_pred_signal,
     ))
     session_id = cur.lastrowid
 
@@ -238,7 +324,8 @@ def list_clf_sessions(stock_code: str) -> list:
         "SELECT id, stock_code, stock_name, trained_at, forecast_days, threshold, "
         "look_back, n_splits, selected_models, params_json, "
         "data_start_date, data_end_date, oos_start_date, oos_end_date, "
-        "total_samples, ensemble_metrics, model_metrics, created_at "
+        "total_samples, ensemble_metrics, model_metrics, "
+        "latest_date, latest_proba, latest_signal, created_at "
         "FROM clf_training_sessions WHERE stock_code=%s ORDER BY trained_at DESC",
         (stock_code,))
     cols = [d[0] for d in cur.description]
@@ -255,7 +342,7 @@ def list_clf_sessions(stock_code: str) -> list:
                 except json.JSONDecodeError:
                     pass
         for date_key in ["trained_at", "data_start_date", "data_end_date",
-                         "oos_start_date", "oos_end_date", "created_at"]:
+                         "oos_start_date", "oos_end_date", "latest_date", "created_at"]:
             if r.get(date_key) and hasattr(r[date_key], "strftime"):
                 r[date_key] = r[date_key].strftime("%Y-%m-%d %H:%M")
             elif r.get(date_key) and hasattr(r[date_key], "isoformat"):

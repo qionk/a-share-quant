@@ -1,7 +1,7 @@
 """
 价格预测 - 数据输入
 支持 AKShare API 获取 和 Excel 手动上传两种方式
-akshare 失败时自动切换到东方财富 datacenter API 备用源
+akshare 失败时自动切换到腾讯财经备用源，并尝试通过网易财经补充换手率
 """
 
 import io
@@ -32,29 +32,35 @@ def _market_prefix(stock_code: str) -> str:
 
 def _fetch_via_tencent(stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
     """
-    备用数据源：通过腾讯财经接口获取前复权日K数据
+    备用数据源：通过腾讯财经 newfqkline 接口获取前复权日K数据（含换手率）
     """
+    import requests as _req
+
     prefix = _market_prefix(stock_code)
     symbol = f"{prefix}{stock_code}"
     sd = f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:8]}"
     ed = f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:8]}"
 
     all_klines = []
-    # 腾讯接口每次最多返回约300条，需要分段请求
     current_end = ed
     for _ in range(20):
-        url = (f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+        # newfqkline 接口：返回含换手率的完整日K
+        url = (f"https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get"
                f"?param={symbol},day,{sd},{current_end},800,qfq")
-        result = subprocess.run(
-            ["curl", "-s", "-m", "10", url],
-            capture_output=True, text=True, timeout=15,
-        )
-        if result.returncode != 0 or not result.stdout.strip():
-            break
         try:
-            data = json.loads(result.stdout)
-        except json.JSONDecodeError:
-            break
+            resp = _req.get(url, timeout=10)
+            if resp.status_code != 200:
+                break
+            data = resp.json()
+        except Exception:
+            # fallback 旧接口
+            try:
+                url_old = (f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+                           f"?param={symbol},day,{sd},{current_end},800,qfq")
+                resp = _req.get(url_old, timeout=10)
+                data = resp.json()
+            except Exception:
+                break
 
         stock_data = data.get("data", {}).get(symbol, {})
         klines = stock_data.get("qfqday") or stock_data.get("day", [])
@@ -65,7 +71,6 @@ def _fetch_via_tencent(stock_code: str, start_date: str, end_date: str) -> pd.Da
         earliest = klines[0][0]
         if earliest <= sd:
             break
-        # 下一段的结束日期为当前最早日期的前一天
         from datetime import datetime as dt, timedelta
         prev = (dt.strptime(earliest, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
         current_end = prev
@@ -74,26 +79,22 @@ def _fetch_via_tencent(stock_code: str, start_date: str, end_date: str) -> pd.Da
     if not all_klines:
         return pd.DataFrame()
 
-    # 补齐：如果分页获取的最后日期不是 ed，单独请求最近几天补齐
+    # 补齐尾部
     last_fetched = all_klines[-1][0] if all_klines else None
     if last_fetched and last_fetched < ed:
-        url = (f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+        url = (f"https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get"
                f"?param={symbol},day,{last_fetched},{ed},30,qfq")
-        result = subprocess.run(
-            ["curl", "-s", "-m", "10", url],
-            capture_output=True, text=True, timeout=15,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            try:
-                data2 = json.loads(result.stdout)
+        try:
+            resp = _req.get(url, timeout=10)
+            if resp.status_code == 200:
+                data2 = resp.json()
                 klines2 = data2.get("data", {}).get(symbol, {})
                 klines2 = klines2.get("qfqday") or klines2.get("day", [])
                 if klines2:
-                    # 跳过已存在的第一天
                     extra = [k for k in klines2 if k[0] > last_fetched]
                     all_klines.extend(extra)
-            except json.JSONDecodeError:
-                pass
+        except Exception:
+            pass
 
     # 去重（按日期）
     seen = set()
@@ -104,9 +105,36 @@ def _fetch_via_tencent(stock_code: str, start_date: str, end_date: str) -> pd.Da
             unique.append(k)
     unique.sort(key=lambda x: x[0])
 
-    # 统一截取前6列（date, open, close, high, low, volume），忽略可能存在的第7列
-    trimmed = [row[:6] for row in unique]
-    df = pd.DataFrame(trimmed, columns=["date", "open", "close", "high", "low", "volume"])
+    # newfqkline 字段: [date, open, close, high, low, volume, {ma}, turnover%, amount, ?]
+    # 旧接口字段:      [date, open, close, high, low, volume]
+    rows = []
+    for row in unique:
+        entry = {
+            "date": row[0],
+            "open": row[1],
+            "close": row[2],
+            "high": row[3],
+            "low": row[4],
+            "volume": row[5],
+        }
+        # newfqkline 有更多字段（第7个是dict/ma，第8个是换手率）
+        if len(row) >= 8 and not isinstance(row[7], dict):
+            try:
+                turnover_val = float(row[7])
+                if turnover_val > 0:
+                    entry["turnover"] = turnover_val
+            except (ValueError, TypeError):
+                pass
+        if len(row) >= 9:
+            try:
+                amount_val = float(row[8]) if not isinstance(row[8], dict) else None
+                if amount_val and amount_val > 0:
+                    entry["amount"] = amount_val * 10000  # 腾讯单位是万元
+            except (ValueError, TypeError):
+                pass
+        rows.append(entry)
+
+    df = pd.DataFrame(rows)
     df["date"] = pd.to_datetime(df["date"])
     df = df.sort_values("date").set_index("date")
 
@@ -117,9 +145,59 @@ def _fetch_via_tencent(stock_code: str, start_date: str, end_date: str) -> pd.Da
     # 计算缺失的列
     df["pct_change"] = df["close"].pct_change() * 100
     if "amount" not in df.columns:
-        df["amount"] = df["close"] * df["volume"] * 100  # 估算
+        df["amount"] = df["close"] * df["volume"] * 100
 
     return df
+
+
+def _fetch_turnover_netease(stock_code: str, start_date: str, end_date: str) -> pd.Series:
+    """
+    通过网易财经接口获取换手率数据，返回 Series(index=DatetimeIndex, values=turnover%)。
+    失败返回 None。
+    """
+    try:
+        prefix = "0" + stock_code if stock_code.startswith(("6", "9")) else "1" + stock_code
+        sd = f"{start_date[:4]}{start_date[4:6]}{start_date[6:8]}"
+        ed = f"{end_date[:4]}{end_date[4:6]}{end_date[6:8]}"
+        url = (f"https://quotes.money.163.com/service/chddata.html"
+               f"?code={prefix}&start={sd}&end={ed}&fields=TURNOVER")
+
+        content = None
+        # 优先用 requests（Streamlit Cloud 无 curl）
+        try:
+            import requests
+            resp = requests.get(url, timeout=15)
+            if resp.status_code == 200 and resp.content:
+                content = resp.content.decode("gb2312", errors="ignore")
+        except Exception:
+            pass
+        # fallback: curl
+        if not content:
+            result = subprocess.run(
+                ["curl", "-s", "-m", "15", "-L", url],
+                capture_output=True, text=True, timeout=20,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                content = result.stdout
+
+        if not content:
+            return None
+        from io import StringIO
+        ndf = pd.read_csv(StringIO(content), engine="python")
+        if ndf.empty:
+            return None
+        # 网易列名：日期, 股票代码, 名称, 换手率
+        date_col = ndf.columns[0]
+        turnover_col = [c for c in ndf.columns if "换手" in c]
+        if not turnover_col:
+            return None
+        ndf[date_col] = pd.to_datetime(ndf[date_col])
+        ndf = ndf.sort_values(date_col).set_index(date_col)
+        s = pd.to_numeric(ndf[turnover_col[0]], errors="coerce")
+        s.index.name = None
+        return s
+    except Exception:
+        return None
 
 
 def load_from_akshare(stock_code: str, start_date: str, end_date: str) -> pd.DataFrame:
@@ -177,6 +255,10 @@ def load_from_akshare(stock_code: str, start_date: str, end_date: str) -> pd.Dat
         if df is not None and not df.empty:
             if "pct_change" not in df.columns or df["pct_change"].isna().all():
                 df["pct_change"] = df["close"].pct_change() * 100
+            # 尝试通过网易补充换手率
+            turnover_s = _fetch_turnover_netease(stock_code, start_date, end_date)
+            if turnover_s is not None and not turnover_s.empty:
+                df["turnover"] = turnover_s.reindex(df.index)
             return df
     except Exception:
         pass

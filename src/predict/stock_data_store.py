@@ -12,6 +12,7 @@ import numpy as np
 from datetime import datetime
 
 BATCH_SIZE = 500
+_TABLE_ENSURED = False
 
 
 def _get_conn():
@@ -41,12 +42,72 @@ def _get_conn():
     )
 
 
+def _ensure_unique_index(conn):
+    """确保 stock_daily_data 有 (stock_code, trade_date) 唯一索引，只执行一次"""
+    global _TABLE_ENSURED
+    if _TABLE_ENSURED:
+        return
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS stock_daily_data (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                stock_code VARCHAR(20) NOT NULL,
+                stock_name VARCHAR(100),
+                trade_date DATE NOT NULL,
+                open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE,
+                volume DOUBLE, amount DOUBLE, pct_change DOUBLE, turnover DOUBLE,
+                UNIQUE KEY uk_stock_date (stock_code, trade_date),
+                INDEX idx_stock_code (stock_code)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+    except Exception:
+        pass
+    # 检查唯一索引是否已存在
+    cur.execute("SHOW INDEX FROM stock_daily_data WHERE Key_name='uk_stock_date'")
+    if not cur.fetchall():
+        # 索引不存在，先去重再加
+        try:
+            cur.execute("""
+                DELETE d1 FROM stock_daily_data d1
+                INNER JOIN stock_daily_data d2
+                WHERE d1.id < d2.id
+                  AND d1.stock_code = d2.stock_code
+                  AND d1.trade_date = d2.trade_date
+            """)
+        except Exception:
+            pass
+        try:
+            cur.execute("ALTER TABLE stock_daily_data ADD UNIQUE KEY uk_stock_date (stock_code, trade_date)")
+        except Exception:
+            pass
+    cur.close()
+    _TABLE_ENSURED = True
+
+
+_DEDUP_DONE = False
+
+
+def _dedup_stock_table():
+    """清理 stock_daily_data 中的重复行并确保唯一索引，整个进程只执行一次"""
+    global _DEDUP_DONE
+    if _DEDUP_DONE:
+        return
+    conn = _get_conn()
+    if not conn:
+        return
+    _ensure_unique_index(conn)
+    conn.close()
+    _DEDUP_DONE = True
+
+
 def store_stock_data(stock_code: str, stock_name: str, df: pd.DataFrame) -> int:
     """将 DataFrame 写入 stock_daily_data，返回写入行数"""
     conn = _get_conn()
     if not conn:
         return 0
 
+    _ensure_unique_index(conn)
     cur = conn.cursor()
     sql = """
         INSERT INTO stock_daily_data
@@ -126,7 +187,7 @@ def _safe_float(v):
 
 
 def load_stock_from_db(stock_code: str) -> pd.DataFrame:
-    """从 MySQL 加载股票日线数据，返回 DataFrame（date 索引）"""
+    """从 MySQL 加载股票日线数据，返回 DataFrame（date 索引，去重）"""
     conn = _get_conn()
     if not conn:
         return pd.DataFrame()
@@ -147,6 +208,7 @@ def load_stock_from_db(stock_code: str) -> pd.DataFrame:
     df = pd.DataFrame(rows, columns=cols)
     df["trade_date"] = pd.to_datetime(df["trade_date"])
     df = df.set_index("trade_date")
+    df = df[~df.index.duplicated(keep="last")]
     df.index.name = "date"
     return df
 
@@ -158,7 +220,7 @@ def list_db_stocks() -> list:
         return []
     cur = conn.cursor()
     cur.execute("""
-        SELECT stock_code, stock_name, COUNT(*) AS data_rows,
+        SELECT stock_code, stock_name, COUNT(DISTINCT trade_date) AS data_rows,
                MIN(trade_date) AS start_date, MAX(trade_date) AS end_date
         FROM stock_daily_data
         GROUP BY stock_code, stock_name
@@ -181,13 +243,14 @@ def list_db_stocks() -> list:
 def list_stocks_with_status() -> list:
     """统一视图: 股票数据 + 训练状态 [{code, name, data_rows, start_date, end_date,
        trained, trained_at, trained_models, session_id}]"""
+    _dedup_stock_table()
     conn = _get_conn()
     if not conn:
         return []
     cur = conn.cursor()
     cur.execute("""
         SELECT d.stock_code, d.stock_name,
-               COUNT(*) AS data_rows,
+               COUNT(DISTINCT d.trade_date) AS data_rows,
                MIN(d.trade_date) AS start_date,
                MAX(d.trade_date) AS end_date,
                MAX(t.trained_at) AS trained_at,
@@ -265,6 +328,41 @@ def list_stock_sessions(stock_code: str) -> list:
     return rows
 
 
+def _fill_turnover_if_missing(stock_code: str, stock_name: str, df: pd.DataFrame,
+                              start_date: str, end_date: str) -> pd.DataFrame:
+    """如果 turnover 缺失超过 50%，从网易源补充并批量更新 DB"""
+    if 'turnover' not in df.columns or df.empty:
+        return df
+    valid_ratio = df['turnover'].notna().mean()
+    if valid_ratio >= 0.5:
+        return df
+    try:
+        from src.predict.data_input import _fetch_turnover_netease
+        turnover_s = _fetch_turnover_netease(stock_code, start_date, end_date)
+        if turnover_s is not None and not turnover_s.empty:
+            df['turnover'] = turnover_s.reindex(df.index)
+            # 批量写回 DB
+            conn = _get_conn()
+            if conn:
+                cur = conn.cursor()
+                updates = []
+                for idx in df.index:
+                    t_val = _safe_float(df.loc[idx, 'turnover'])
+                    if t_val is not None:
+                        trade_date = idx.date() if hasattr(idx, 'date') else pd.Timestamp(idx).date()
+                        updates.append((t_val, stock_code, trade_date))
+                if updates:
+                    cur.executemany(
+                        "UPDATE stock_daily_data SET turnover=%s "
+                        "WHERE stock_code=%s AND trade_date=%s",
+                        updates)
+                cur.close()
+                conn.close()
+    except Exception:
+        pass
+    return df
+
+
 def fetch_and_store(stock_code: str, start_date: str = "20200101",
                     end_date: str = None, max_days: int = 500,
                     progress_callback=None) -> tuple:
@@ -276,6 +374,9 @@ def fetch_and_store(stock_code: str, start_date: str = "20200101",
     """
     if end_date is None:
         end_date = datetime.now().strftime("%Y%m%d")
+
+    # 首次调用时确保唯一索引 + 清理历史重复数据
+    _dedup_stock_table()
 
     if progress_callback:
         progress_callback("checking")
@@ -320,6 +421,9 @@ def fetch_and_store(stock_code: str, start_date: str = "20200101",
                 # 按请求的起始日期截取
                 req_start = pd.Timestamp(start_date)
                 df = df[df.index >= req_start]
+
+                # 补充换手率：如果 DB 数据中 turnover 大部分为空，尝试网易源补齐
+                df = _fill_turnover_if_missing(stock_code, name, df, start_date, end_date)
 
                 # 按 max_days 截取
                 if max_days and len(df) > max_days:
