@@ -293,6 +293,12 @@ if "clf_autotune_results" not in st.session_state:
     st.session_state.clf_autotune_results = None
 if "_clf_tune_train_active" not in st.session_state:
     st.session_state._clf_tune_train_active = False
+if "clf_feature_screen" not in st.session_state:
+    st.session_state.clf_feature_screen = False
+if "clf_top_n_features" not in st.session_state:
+    st.session_state.clf_top_n_features = 50
+if "clf_screening_info" not in st.session_state:
+    st.session_state.clf_screening_info = None
 
 
 def _param_changed(model_name, key, value, default_val):
@@ -986,6 +992,16 @@ with st.sidebar:
         step=0.01, format="%.2f", key="clf_threshold_slider",
         help="融合概率 >= 阈值时做多，否则空仓（默认0.5）")
 
+    _clf_fs = st.checkbox("特征预筛选", value=st.session_state.get("clf_feature_screen", False),
+                          key="clf_feature_screen",
+                          help="先用XGBoost训练一遍，按重要性保留top-N特征再正式训练")
+    if _clf_fs:
+        st.session_state.clf_top_n_features = st.slider(
+            "保留特征数", min_value=10, max_value=60,
+            value=st.session_state.get("clf_top_n_features", 50),
+            key="clf_top_n_slider",
+            help="按重要性保留前N个base特征")
+
     st.caption("分类器参数（🔵 = 已修改）")
     c1, c2 = st.columns(2)
     with c1:
@@ -1511,7 +1527,7 @@ if btn_clf_train and st.session_state.stock_data is not None:
     try:
         clf_progress_cb(0.0, "数据预处理中...")
 
-        results, ensemble_result = run_classifier_pipeline(
+        results, ensemble_result, screening_info = run_classifier_pipeline(
             df=st.session_state.stock_data,
             selected_models=st.session_state.clf_selected_models,
             params=st.session_state.clf_params,
@@ -1521,11 +1537,14 @@ if btn_clf_train and st.session_state.stock_data is not None:
             forecast_days=st.session_state.clf_forecast_days,
             threshold=st.session_state.clf_threshold,
             stock_code=st.session_state.stock_code,
+            feature_screen=st.session_state.get("clf_feature_screen", False),
+            top_n_features=st.session_state.get("clf_top_n_features", 50),
         )
 
         st.session_state.clf_results = results
         st.session_state.clf_ensemble_result = ensemble_result
         st.session_state.clf_results_stock_code = st.session_state.stock_code
+        st.session_state.clf_screening_info = screening_info
 
         # 保存到历史库
         try:
@@ -1777,7 +1796,7 @@ if _tune_train_active and st.session_state.stock_data is not None:
         _tune_train_cb(0.0, "数据预处理中...")
         from src.predict.ensemble_classifier import run_classifier_pipeline
 
-        results, ensemble_result = run_classifier_pipeline(
+        results, ensemble_result, screening_info = run_classifier_pipeline(
             df=st.session_state.stock_data,
             selected_models=st.session_state.clf_selected_models,
             params=_tune_params,
@@ -1787,11 +1806,14 @@ if _tune_train_active and st.session_state.stock_data is not None:
             forecast_days=bp["forecast_days"],
             threshold=st.session_state.clf_threshold,
             stock_code=st.session_state.stock_code,
+            feature_screen=st.session_state.get("clf_feature_screen", False),
+            top_n_features=st.session_state.get("clf_top_n_features", 50),
         )
 
         st.session_state.clf_results = results
         st.session_state.clf_ensemble_result = ensemble_result
         st.session_state.clf_results_stock_code = st.session_state.stock_code
+        st.session_state.clf_screening_info = screening_info
 
         st.session_state.clf_look_back = bp["look_back"]
         st.session_state.clf_forecast_days = bp["forecast_days"]
@@ -2921,6 +2943,29 @@ with tab9:
             if _has_excess:
                 _tag_parts.append("相对强弱 ✅")
             st.caption(" | ".join(_tag_parts))
+
+        # ── 特征预筛选结果 ──
+        _scr_info = st.session_state.get("clf_screening_info")
+        if _scr_info:
+            _scr_orig = _scr_info["original"]
+            _scr_kept = _scr_info["kept"]
+            _scr_elim = _scr_info["eliminated"]
+            with st.expander(f"特征预筛选: {_scr_orig} → {_scr_kept}（淘汰 {len(_scr_elim)} 个低重要性特征）"):
+                _scr_col1, _scr_col2 = st.columns(2)
+                with _scr_col1:
+                    st.markdown("**保留特征**")
+                    _kept_df = pd.DataFrame([
+                        {"特征": f, "重要性": "高"} for f in _scr_info["kept_features"]
+                    ])
+                    st.dataframe(_kept_df, use_container_width=True, hide_index=True, height=300)
+                with _scr_col2:
+                    st.markdown("**淘汰特征**")
+                    _elim_df = pd.DataFrame([
+                        {"特征": r["feature"], "重要性": f"{r['importance']:.4f}", "排名": r["rank"]}
+                        for r in _scr_elim
+                    ])
+                    st.dataframe(_elim_df, use_container_width=True, hide_index=True, height=300)
+
         # ── 融合集成指标卡 ──
         show_ensemble = ens is not None and len(st.session_state.clf_selected_models) == 2
         if show_ensemble:

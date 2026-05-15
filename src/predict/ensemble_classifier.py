@@ -793,6 +793,95 @@ def _load_index_returns(stock_code: str, start_date, end_date) -> Optional[pd.Se
         return None
 
 
+# ── 特征预筛选 ──
+
+def _screen_features(
+    df_ind: pd.DataFrame,
+    available_features: List[str],
+    look_back: int,
+    top_n: int = 50,
+) -> Tuple[List[str], List[dict]]:
+    """
+    快速 XGBoost 预训练，按 base 特征聚合重要性，保留 top_n 个。
+    返回: (selected_features, eliminated_records)
+    """
+    import xgboost as xgb
+
+    X, y, feature_names, _, _, _ = create_clf_features(df_ind, available_features, look_back)
+
+    if len(X) < 50:
+        return available_features, []
+
+    split_idx = int(len(X) * 0.8)
+    X_train, X_val = X[:split_idx], X[split_idx:]
+    y_train, y_val = y[:split_idx], y[split_idx:]
+
+    clf = xgb.XGBClassifier(
+        n_estimators=100, max_depth=4, learning_rate=0.05,
+        subsample=0.8, colsample_bytree=0.8,
+        objective="binary:logistic", eval_metric="logloss",
+        random_state=42, n_jobs=-1, verbosity=0,
+        early_stopping_rounds=10,
+    )
+    clf.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+
+    importances = clf.feature_importances_
+
+    base_importance = {}
+    for i, feat_name in enumerate(feature_names):
+        base = feat_name.rsplit("_lag", 1)[0]
+        base_importance[base] = base_importance.get(base, 0.0) + importances[i]
+
+    sorted_feats = sorted(base_importance.items(), key=lambda x: x[1], reverse=True)
+
+    selected = [f for f, _ in sorted_feats[:top_n]]
+    eliminated = []
+    for rank, (feat, imp) in enumerate(sorted_feats[top_n:], start=top_n + 1):
+        eliminated.append({"feature": feat, "importance": float(imp), "rank": rank})
+
+    return selected, eliminated
+
+
+def _log_eliminated_features(stock_code: str, records: List[dict], kept_count: int):
+    """将淘汰特征写入 MySQL 日志表"""
+    if not records or not stock_code:
+        return
+    try:
+        from .stock_data_store import _get_conn
+        conn = _get_conn()
+        if not conn:
+            return
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS clf_feature_elimination_log (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                stock_code VARCHAR(20) NOT NULL,
+                feature_name VARCHAR(100) NOT NULL,
+                importance DOUBLE,
+                rank_in_total INT,
+                total_features INT,
+                kept_features INT,
+                eliminated_at DATETIME NOT NULL,
+                INDEX idx_fe_stock (stock_code),
+                INDEX idx_fe_feature (feature_name)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+        from datetime import datetime
+        now = datetime.now()
+        total = kept_count + len(records)
+        rows = [(stock_code, r["feature"], r["importance"], r["rank"], total, kept_count, now)
+                for r in records]
+        cur.executemany(
+            "INSERT INTO clf_feature_elimination_log "
+            "(stock_code, feature_name, importance, rank_in_total, total_features, kept_features, eliminated_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+            rows)
+        cur.close()
+        conn.close()
+    except Exception:
+        pass
+
+
 # ── 完整管线 ──
 
 def run_classifier_pipeline(
@@ -805,6 +894,8 @@ def run_classifier_pipeline(
     forecast_days: int = 1,
     threshold: float = 0.5,
     stock_code: str = None,
+    feature_screen: bool = False,
+    top_n_features: int = 50,
 ):
     """
     分类器完整管线。
@@ -844,6 +935,24 @@ def run_classifier_pipeline(
     available_features = [c for c in CLF_FEATURE_COLS if c in df_ind.columns]
     if len(available_features) < 3:
         raise ValueError(f"可用特征不足 ({len(available_features)})，请检查数据完整性")
+
+    # 3.5 特征预筛选：XGBoost 快速训练 → 保留 top_n base 特征
+    _screening_info = None
+    if feature_screen and len(available_features) > top_n_features:
+        if progress_cb:
+            progress_cb(0.05, f"特征预筛选: {len(available_features)} 个特征中选取 top {top_n_features}...")
+        _orig_count = len(available_features)
+        available_features, _eliminated = _screen_features(
+            df_ind, available_features, look_back, top_n=top_n_features)
+        _log_eliminated_features(stock_code, _eliminated, len(available_features))
+        _screening_info = {
+            "original": _orig_count,
+            "kept": len(available_features),
+            "eliminated": _eliminated,
+            "kept_features": available_features[:],
+        }
+        if progress_cb:
+            progress_cb(0.08, f"特征筛选完成: {_orig_count} → {len(available_features)}")
 
     if progress_cb:
         progress_cb(0.1, "构造滞后特征...")
@@ -934,7 +1043,10 @@ def run_classifier_pipeline(
     if progress_cb:
         progress_cb(1.0, "涨跌预测完成!")
 
-    return results, ensemble_result
+    if ensemble_result and _screening_info:
+        ensemble_result["screening_info"] = _screening_info
+
+    return results, ensemble_result, _screening_info
 
 
 # ── 自动调参：随机搜索 + 早停 ──
@@ -1009,7 +1121,7 @@ def auto_tune_classifier(
 
         t0 = time.time()
         try:
-            results, ensemble_result = run_classifier_pipeline(
+            results, ensemble_result, _ = run_classifier_pipeline(
                 df=df,
                 selected_models=selected_models,
                 params=params,
@@ -1133,7 +1245,7 @@ def auto_tune_optuna(
 
         t0 = time.time()
         try:
-            results, ensemble_result = run_classifier_pipeline(
+            results, ensemble_result, _ = run_classifier_pipeline(
                 df=df,
                 selected_models=selected_models,
                 params=params,
@@ -1237,7 +1349,7 @@ def _run_single_trial(args):
 
     t0 = time.time()
     try:
-        results, ensemble_result = run_classifier_pipeline(
+        results, ensemble_result, _ = run_classifier_pipeline(
             df=df,
             selected_models=selected_models,
             params=params,

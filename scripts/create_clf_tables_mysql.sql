@@ -42,3 +42,16 @@ CREATE TABLE IF NOT EXISTS clf_prediction_details (
     INDEX idx_clf_trade_date (trade_date),
     FOREIGN KEY (session_id) REFERENCES clf_training_sessions(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS clf_feature_elimination_log (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    stock_code VARCHAR(20) NOT NULL,
+    feature_name VARCHAR(100) NOT NULL,
+    importance DOUBLE,
+    rank_in_total INT,
+    total_features INT,
+    kept_features INT,
+    eliminated_at DATETIME NOT NULL,
+    INDEX idx_fe_stock (stock_code),
+    INDEX idx_fe_feature (feature_name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
