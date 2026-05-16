@@ -992,16 +992,6 @@ with st.sidebar:
         step=0.01, format="%.2f", key="clf_threshold_slider",
         help="融合概率 >= 阈值时做多，否则空仓（默认0.5）")
 
-    _clf_fs = st.checkbox("特征预筛选", value=st.session_state.get("clf_feature_screen", False),
-                          key="clf_feature_screen",
-                          help="先用XGBoost训练一遍，按重要性保留top-N特征再正式训练")
-    if _clf_fs:
-        st.session_state.clf_top_n_features = st.slider(
-            "保留特征数", min_value=10, max_value=60,
-            value=st.session_state.get("clf_top_n_features", 50),
-            key="clf_top_n_slider",
-            help="按重要性保留前N个base特征")
-
     st.caption("分类器参数（🔵 = 已修改）")
     c1, c2 = st.columns(2)
     with c1:
@@ -2893,6 +2883,19 @@ with tab8:
 # ── Tab 9: 涨跌预测 ──────────────────────────────────────────
 
 with tab9:
+    # 特征预筛选选项（放在页面内方便交互）
+    _fs_col1, _fs_col2 = st.columns([1, 1])
+    with _fs_col1:
+        st.checkbox("特征预筛选", value=st.session_state.get("clf_feature_screen", False),
+                    key="clf_feature_screen",
+                    help="先用XGBoost训练一遍，按重要性保留top-N特征再正式训练")
+    with _fs_col2:
+        if st.session_state.get("clf_feature_screen", False):
+            st.slider("保留特征数", min_value=10, max_value=60,
+                      value=st.session_state.get("clf_top_n_features", 50),
+                      key="clf_top_n_slider",
+                      help="按重要性保留前N个base特征")
+
     # 切换股票后自动清除旧结果
     if (st.session_state.clf_results is not None
             and st.session_state.clf_results_stock_code
@@ -3116,28 +3119,56 @@ with tab9:
         # 构建日期→位置映射（归一化到 date 粒度避免精度问题），后续多处复用
         _cur_df = st.session_state.stock_data
         _cur_date_pos = {}
+        _cur_date_str_pos = {}
+        _base_ndr_patched = None
         if _cur_df is not None and not _cur_df.empty:
-            _cur_date_pos = {d.date(): i for i, d in enumerate(_cur_df.index)}
+            for _idx_i, _idx_d in enumerate(_cur_df.index):
+                _cur_date_pos[_idx_d.date()] = _idx_i
+                _cur_date_str_pos[_idx_d.strftime("%Y-%m-%d")] = _idx_i
 
         if first_model in results:
             base_dates_f = results[first_model].oos_dates
             base_future_ret_f = results[first_model].oos_future_ret.copy()
 
             # 用当前 stock_data 补充训练时无法计算的 future_ret（NaN → 实际收益）
+            _filled_count = 0
+            _nan_count = 0
             if _cur_date_pos and len(base_dates_f) > 0:
                 _fd = st.session_state.clf_forecast_days
                 for _i in range(len(base_future_ret_f)):
                     if not np.isnan(base_future_ret_f[_i]):
                         continue
-                    _dt = pd.Timestamp(base_dates_f[_i]).date()
-                    if _dt in _cur_date_pos:
-                        _pos = _cur_date_pos[_dt]
+                    _nan_count += 1
+                    _ts = pd.Timestamp(base_dates_f[_i])
+                    _dt = _ts.date()
+                    _dt_str = _ts.strftime("%Y-%m-%d")
+                    _pos = _cur_date_pos.get(_dt) or _cur_date_str_pos.get(_dt_str)
+                    if _pos is not None:
                         _target_pos = _pos + _fd
                         if _target_pos < len(_cur_df):
                             _close_now = float(_cur_df.iloc[_pos]["close"])
                             _close_future = float(_cur_df.iloc[_target_pos]["close"])
                             if _close_now > 0:
                                 base_future_ret_f[_i] = (_close_future - _close_now) / _close_now
+                                _filled_count += 1
+
+            # 同样补充 next_day_ret（用于策略收益列）
+            _base_ndr = getattr(results[first_model], 'oos_next_day_ret', None)
+            if _base_ndr is not None and _cur_date_str_pos:
+                _base_ndr_patched = _base_ndr.copy()
+                for _i in range(len(_base_ndr_patched)):
+                    if not np.isnan(_base_ndr_patched[_i]):
+                        continue
+                    _ts = pd.Timestamp(base_dates_f[_i])
+                    _dt_str = _ts.strftime("%Y-%m-%d")
+                    _pos = _cur_date_pos.get(_ts.date()) or _cur_date_str_pos.get(_dt_str)
+                    if _pos is not None and _pos + 1 < len(_cur_df):
+                        _c0 = float(_cur_df.iloc[_pos]["close"])
+                        _c1 = float(_cur_df.iloc[_pos + 1]["close"])
+                        if _c0 > 0:
+                            _base_ndr_patched[_i] = (_c1 - _c0) / _c0
+            else:
+                _base_ndr_patched = _base_ndr
 
         # ── 今日实时预测（基于最新交易日特征） ──
         _has_latest = False
@@ -3212,7 +3243,7 @@ with tab9:
         n_recent = st.number_input("显示最近 N 天", min_value=10, max_value=60, value=30, step=5, key="clf_recent_n")
 
         if first_model in results:
-            base_next_day_f = getattr(results[first_model], 'oos_next_day_ret', results[first_model].oos_returns)
+            base_next_day_f = _base_ndr_patched if _base_ndr_patched is not None else getattr(results[first_model], 'oos_next_day_ret', results[first_model].oos_returns)
             total = len(base_dates_f)
             start_idx = max(0, total - n_recent)
 
@@ -3288,7 +3319,7 @@ with tab9:
         if first_model in results:
             base_dates_e = results[first_model].oos_dates
             base_future_ret_e = base_future_ret_f  # 使用已补充实际收益的版本
-            base_next_day_e = getattr(results[first_model], 'oos_next_day_ret', results[first_model].oos_returns)
+            base_next_day_e = _base_ndr_patched if _base_ndr_patched is not None else getattr(results[first_model], 'oos_next_day_ret', results[first_model].oos_returns)
             n_total = len(base_dates_e)
 
             export_rows = []
